@@ -25,10 +25,19 @@ import type {
   Assignment,
   AssignmentStatus,
   SpeakingQuestion,
+  StudentProgress,
   StudentRosterEntry,
   Submission,
   UserProfile,
 } from '../types';
+
+export const FIRESTORE_COLLECTIONS = {
+  USERS: 'users',
+  ASSIGNMENTS: 'assignments',
+  SUBMISSIONS: 'submissions',
+  STUDENT_PROGRESS: 'studentProgress',
+  STUDENT_ROSTER: 'studentRoster',
+} as const;
 
 export function makeSafeId(prefix: string): string {
   const rand =
@@ -540,3 +549,248 @@ export async function setSubmissionResubmissionAllowed(
     handleFirestoreError(error, OperationType.UPDATE, path);
   }
 }
+
+// ---------------- STUDENT PROGRESS & COLLECTION INITIALIZERS ----------------
+
+/**
+ * Initializes the 'users' collection document for an authenticated user.
+ */
+export async function initializeUsersCollection(
+  authUser: User
+): Promise<UserProfile> {
+  return ensureUserProfile(authUser);
+}
+
+/**
+ * Initializes a document in the 'assignments' collection.
+ */
+export async function initializeAssignmentsCollection(params: {
+  weekNumber: number;
+  title: string;
+  topic: string;
+  instructions: string;
+  questions: SpeakingQuestion[];
+  deadline: string;
+  status: AssignmentStatus;
+  createdBy: string;
+}): Promise<string> {
+  return createAssignment(params);
+}
+
+/**
+ * Initializes a document in the 'submissions' collection.
+ */
+export async function initializeSubmissionsCollection(params: {
+  submissionId: string;
+  isResubmission: boolean;
+  student: UserProfile;
+  assignment: Assignment;
+  question: SpeakingQuestion;
+  audioStorageType: 'firebase_storage' | 'firestore_chunks';
+  audioStoragePath: string;
+  audioMimeType: string;
+  audioChunkCount: number;
+  recordingDuration: number;
+}): Promise<void> {
+  return createOrReplaceProcessingSubmission(params);
+}
+
+/**
+ * Initializes the 'studentProgress' collection document for a student with
+ * zero counts and null averages (never fabricated default scores).
+ */
+export async function initializeStudentProgressCollection(
+  student: Pick<UserProfile, 'userId' | 'studentId'>
+): Promise<StudentProgress> {
+  const path = `${FIRESTORE_COLLECTIONS.STUDENT_PROGRESS}/${student.userId}`;
+  const docRef = doc(db, FIRESTORE_COLLECTIONS.STUDENT_PROGRESS, student.userId);
+
+  let existingSnap;
+  try {
+    existingSnap = await getDoc(docRef);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, path);
+  }
+
+  if (existingSnap.exists()) {
+    return existingSnap.data() as StudentProgress;
+  }
+
+  const initialDoc = {
+    studentUid: student.userId,
+    studentId: (student.studentId || '').slice(0, 40),
+    totalAssignments: 0,
+    completedAssignments: 0,
+    totalQuestionsSubmitted: 0,
+    averageGrammarVocabulary: null,
+    averageDiscourseManagement: null,
+    averagePronunciation: null,
+    averageOverallScore: null,
+    latestSubmissionDate: null,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  };
+
+  try {
+    await setDoc(docRef, initialDoc);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, path);
+  }
+
+  const createdSnap = await getDoc(docRef);
+  return createdSnap.data() as StudentProgress;
+}
+
+/**
+ * Recalculates and persists a student's 'studentProgress' summary document
+ * strictly from real Firestore assignment and submission records.
+ */
+export async function recalculateAndSyncStudentProgress(
+  student: Pick<UserProfile, 'userId' | 'studentId'>,
+  knownAssignments?: Assignment[],
+  knownSubmissions?: Submission[]
+): Promise<StudentProgress> {
+  const path = `${FIRESTORE_COLLECTIONS.STUDENT_PROGRESS}/${student.userId}`;
+  await initializeStudentProgressCollection(student);
+
+  let assignmentsList = knownAssignments;
+  if (!assignmentsList) {
+    try {
+      const assignSnap = await getDocs(
+        query(
+          collection(db, FIRESTORE_COLLECTIONS.ASSIGNMENTS),
+          where('status', 'in', ['open', 'locked'])
+        )
+      );
+      assignmentsList = assignSnap.docs.map((d) => d.data() as Assignment);
+    } catch (error) {
+      handleFirestoreError(
+        error,
+        OperationType.LIST,
+        FIRESTORE_COLLECTIONS.ASSIGNMENTS
+      );
+    }
+  }
+
+  let submissionsList = knownSubmissions;
+  if (!submissionsList) {
+    try {
+      const subSnap = await getDocs(
+        query(
+          collection(db, FIRESTORE_COLLECTIONS.SUBMISSIONS),
+          where('studentUid', '==', student.userId)
+        )
+      );
+      submissionsList = subSnap.docs.map((d) => d.data() as Submission);
+    } catch (error) {
+      handleFirestoreError(
+        error,
+        OperationType.LIST,
+        FIRESTORE_COLLECTIONS.SUBMISSIONS
+      );
+    }
+  }
+
+  const publishedAssignments = assignmentsList.filter((a) => a.status !== 'draft');
+  const assessed = submissionsList.filter(
+    (s) => s.processingStatus === 'feedback_available' && s.assessment !== null
+  );
+
+  let completedAssignments = 0;
+  for (const week of publishedAssignments) {
+    const weekAssessed = assessed.filter(
+      (s) => s.assignmentId === week.assignmentId
+    );
+    if (week.questions.length > 0 && weekAssessed.length >= week.questions.length) {
+      completedAssignments++;
+    }
+  }
+
+  const roundOne = (n: number) => Math.round(n * 10) / 10;
+  let avgGV: number | null = null;
+  let avgDM: number | null = null;
+  let avgPR: number | null = null;
+  let avgOverall: number | null = null;
+
+  if (assessed.length > 0) {
+    const count = assessed.length;
+    avgGV = roundOne(
+      assessed.reduce((acc, s) => acc + s.assessment!.grammar_vocabulary.score, 0) /
+        count
+    );
+    avgDM = roundOne(
+      assessed.reduce(
+        (acc, s) => acc + s.assessment!.discourse_management.score,
+        0
+      ) / count
+    );
+    avgPR = roundOne(
+      assessed.reduce((acc, s) => acc + s.assessment!.pronunciation.score, 0) /
+        count
+    );
+    avgOverall = roundOne(
+      assessed.reduce(
+        (acc, s) => acc + (s.overallScore ?? s.assessment!.overall_score),
+        0
+      ) / count
+    );
+  }
+
+  const sortedByDate = [...submissionsList]
+    .filter((s) => Boolean(s.submittedAt))
+    .sort((a, b) => (b.submittedAt?.seconds || 0) - (a.submittedAt?.seconds || 0));
+  const latestSubmissionDate = sortedByDate[0]?.submittedAt || null;
+
+  try {
+    await updateDoc(doc(db, FIRESTORE_COLLECTIONS.STUDENT_PROGRESS, student.userId), {
+      studentId: (student.studentId || '').slice(0, 40),
+      totalAssignments: publishedAssignments.length,
+      completedAssignments,
+      totalQuestionsSubmitted: submissionsList.length,
+      averageGrammarVocabulary: avgGV,
+      averageDiscourseManagement: avgDM,
+      averagePronunciation: avgPR,
+      averageOverallScore: avgOverall,
+      latestSubmissionDate,
+      updatedAt: serverTimestamp(),
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, path);
+  }
+
+  const updatedSnap = await getDoc(
+    doc(db, FIRESTORE_COLLECTIONS.STUDENT_PROGRESS, student.userId)
+  );
+  return updatedSnap.data() as StudentProgress;
+}
+
+/**
+ * Bootstraps and verifies core Firestore collection records for the signed-in user:
+ * 'users', 'studentProgress', and verifies read access to 'assignments' and 'submissions'.
+ */
+export async function initializeFirestoreCollections(authUser: User): Promise<{
+  profile: UserProfile;
+  progress: StudentProgress | null;
+  collectionsInitialized: string[];
+}> {
+  const profile = await initializeUsersCollection(authUser);
+  const collectionsInitialized: string[] = [FIRESTORE_COLLECTIONS.USERS];
+
+  let progress: StudentProgress | null = null;
+  if (profile.role === 'student') {
+    progress = await initializeStudentProgressCollection(profile);
+    collectionsInitialized.push(FIRESTORE_COLLECTIONS.STUDENT_PROGRESS);
+  }
+
+  collectionsInitialized.push(
+    FIRESTORE_COLLECTIONS.ASSIGNMENTS,
+    FIRESTORE_COLLECTIONS.SUBMISSIONS
+  );
+
+  return {
+    profile,
+    progress,
+    collectionsInitialized,
+  };
+}
+

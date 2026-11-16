@@ -404,6 +404,71 @@
         }
       },
       "required": ["chunkIndex", "data", "studentUid", "createdAt"]
+    },
+    "StudentProgress": {
+      "title": "StudentProgress",
+      "description": "Aggregated speaking progress metrics calculated strictly from actual student submissions.",
+      "type": "object",
+      "properties": {
+        "studentUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "studentId": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 40
+        },
+        "totalAssignments": {
+          "type": "integer"
+        },
+        "completedAssignments": {
+          "type": "integer"
+        },
+        "totalQuestionsSubmitted": {
+          "type": "integer"
+        },
+        "averageGrammarVocabulary": {
+          "type": "number"
+        },
+        "averageDiscourseManagement": {
+          "type": "number"
+        },
+        "averagePronunciation": {
+          "type": "number"
+        },
+        "averageOverallScore": {
+          "type": "number"
+        },
+        "latestSubmissionDate": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "studentUid",
+        "studentId",
+        "totalAssignments",
+        "completedAssignments",
+        "totalQuestionsSubmitted",
+        "averageGrammarVocabulary",
+        "averageDiscourseManagement",
+        "averagePronunciation",
+        "averageOverallScore",
+        "latestSubmissionDate",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -426,6 +491,10 @@
     "/submissions/{submissionId}/audioChunks/{chunkIndex}": {
       "schema": { "$ref": "#/entities/AudioChunk" },
       "description": "Secured audio recording chunks owned by the submitting student and readable by teachers."
+    },
+    "/studentProgress/{studentUid}": {
+      "schema": { "$ref": "#/entities/StudentProgress" },
+      "description": "Student speaking progress summary calculated from assessed submissions."
     }
   }
 }

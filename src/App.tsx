@@ -4,7 +4,7 @@ import { AlertTriangle, RefreshCw } from 'lucide-react';
 import { AuthScreen } from './components/AuthScreen';
 import { StudentDashboard } from './components/student/StudentDashboard';
 import { TeacherDashboard } from './components/teacher/TeacherDashboard';
-import { ensureUserProfile } from './lib/db';
+import { initializeFirestoreCollections } from './lib/db';
 import { auth } from './lib/firebase';
 import type { UserProfile } from './types';
 
@@ -17,7 +17,7 @@ export default function App() {
   const loadProfile = async (user: User) => {
     setBootError(null);
     try {
-      const prof = await ensureUserProfile(user);
+      const { profile: prof } = await initializeFirestoreCollections(user);
       setProfile(prof);
     } catch (err: any) {
       setBootError(

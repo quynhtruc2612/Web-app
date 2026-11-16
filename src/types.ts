@@ -126,3 +126,19 @@ export interface AssessmentApiResponse {
   aiModel: string;
   promptVersion: string;
 }
+
+export interface StudentProgress {
+  studentUid: string;
+  studentId: string;
+  totalAssignments: number;
+  completedAssignments: number;
+  totalQuestionsSubmitted: number;
+  averageGrammarVocabulary: number | null;
+  averageDiscourseManagement: number | null;
+  averagePronunciation: number | null;
+  averageOverallScore: number | null;
+  latestSubmissionDate: any;
+  createdAt: any;
+  updatedAt: any;
+}
+

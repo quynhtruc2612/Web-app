@@ -196,6 +196,37 @@ service cloud.firestore {
         data.createdAt is timestamp;
     }
 
+    function isValidNullableScore(val) {
+      return val == null || (val is number && val >= 0 && val <= 5);
+    }
+
+    function isValidStudentProgress(data, studentUid) {
+      return data.keys().hasAll([
+          'studentUid', 'studentId', 'totalAssignments', 'completedAssignments',
+          'totalQuestionsSubmitted', 'averageGrammarVocabulary',
+          'averageDiscourseManagement', 'averagePronunciation',
+          'averageOverallScore', 'latestSubmissionDate', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'studentUid', 'studentId', 'totalAssignments', 'completedAssignments',
+          'totalQuestionsSubmitted', 'averageGrammarVocabulary',
+          'averageDiscourseManagement', 'averagePronunciation',
+          'averageOverallScore', 'latestSubmissionDate', 'createdAt', 'updatedAt'
+        ]) &&
+        data.studentUid is string && data.studentUid == studentUid && isValidId(data.studentUid) &&
+        data.studentId is string && data.studentId.size() <= 40 &&
+        data.totalAssignments is int && data.totalAssignments >= 0 && data.totalAssignments <= 1000 &&
+        data.completedAssignments is int && data.completedAssignments >= 0 && data.completedAssignments <= 1000 &&
+        data.totalQuestionsSubmitted is int && data.totalQuestionsSubmitted >= 0 && data.totalQuestionsSubmitted <= 10000 &&
+        isValidNullableScore(data.averageGrammarVocabulary) &&
+        isValidNullableScore(data.averageDiscourseManagement) &&
+        isValidNullableScore(data.averagePronunciation) &&
+        isValidNullableScore(data.averageOverallScore) &&
+        (data.latestSubmissionDate == null || data.latestSubmissionDate is timestamp) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
     // 4. Connection check document
     match /test/connection {
       allow get: if isSignedIn();
@@ -414,6 +445,32 @@ service cloud.firestore {
           get(/databases/$(database)/documents/submissions/$(submissionId)).data.studentUid == request.auth.uid
         );
       }
+    }
+
+    // 9. Student Progress Collection
+    match /studentProgress/{studentUid} {
+      allow get: if isValidId(studentUid) && (isOwner(studentUid) || isTeacher());
+      allow list: if isSignedIn() && (
+        isBootstrappedTeacher() ||
+        resource.data.studentUid == request.auth.uid
+      );
+
+      allow create: if isSignedIn() &&
+        isValidId(studentUid) &&
+        isValidStudentProgress(incoming(), studentUid) &&
+        (isOwner(studentUid) || isTeacher()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isSignedIn() &&
+        isValidId(studentUid) &&
+        isValidStudentProgress(incoming(), studentUid) &&
+        (isOwner(studentUid) || isTeacher()) &&
+        incoming().studentUid == existing().studentUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time;
+
+      allow delete: if isValidId(studentUid) && isTeacher();
     }
   }
 }

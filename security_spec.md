@@ -9,6 +9,7 @@
 5. **Terminal State & Resubmission Lock**: Once a submission reaches `processingStatus: "feedback_available"`, a student cannot overwrite it unless a teacher sets `resubmissionAllowed: true` and the assignment status is `open`.
 6. **Audio Chunk Master Gate**: Access to `/submissions/{submissionId}/audioChunks/{chunkIndex}` is gated by `get()` on the parent `/submissions/{submissionId}` document, restricting reads to the owning student or a verified teacher.
 7. **Temporal Integrity**: `createdAt` is immutable after creation and validated with `request.time` on creation; `updatedAt` is validated with `request.time` on create and update.
+8. **Student Progress Isolation**: `/studentProgress/{studentUid}` documents may only be read by the owning student (`studentUid == request.auth.uid`) or a verified teacher; score averages are bounded strictly to `null` or `0..5`.
 
 ## 2. "Dirty Dozen" Attack Payloads (All Must Yield PERMISSION_DENIED)
 

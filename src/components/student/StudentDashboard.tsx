@@ -41,7 +41,9 @@ import {
 import {
   buildSubmissionId,
   createOrReplaceProcessingSubmission,
+  initializeStudentProgressCollection,
   markSubmissionProcessingStatus,
+  recalculateAndSyncStudentProgress,
   saveSubmissionAssessmentResult,
   updateOwnStudentProfile,
 } from '../../lib/db';
@@ -111,6 +113,12 @@ export const StudentDashboard: React.FC<StudentDashboardProps> = ({
       className: profile.className,
     });
   }, [profile]);
+
+  useEffect(() => {
+    initializeStudentProgressCollection(profile).catch((err) => {
+      console.warn('Could not initialize studentProgress doc:', err);
+    });
+  }, [profile.userId]);
 
   useEffect(() => {
     const unsubs: Array<() => void> = [];
@@ -350,6 +358,9 @@ export const StudentDashboard: React.FC<StudentDashboardProps> = ({
         });
 
         await saveSubmissionAssessmentResult(submissionId, aiResult);
+        recalculateAndSyncStudentProgress(profile, assignments).catch((err) => {
+          console.warn('Progress sync warning:', err);
+        });
 
         setExpandedQuestionId(question.questionId);
         if (aiResult.assessment_status === 'needs_rerecording') {
@@ -418,6 +429,9 @@ export const StudentDashboard: React.FC<StudentDashboardProps> = ({
       });
 
       await saveSubmissionAssessmentResult(submission.submissionId, aiResult);
+      recalculateAndSyncStudentProgress(profile, assignments).catch((err) => {
+        console.warn('Progress sync warning:', err);
+      });
       setBannerNotice({
         message: 'AI assessment completed and feedback is now available!',
         tone: 'success',

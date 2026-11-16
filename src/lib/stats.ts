@@ -9,7 +9,13 @@ export interface WeeklyStudentSummary {
   className: string;
   completedQuestions: number;
   totalQuestions: number;
-  status: 'Not Started' | 'In Progress' | 'Processing' | 'Feedback Available' | 'Needs Re-recording' | 'Failed';
+  status:
+    | 'Not Started'
+    | 'In Progress'
+    | 'Processing'
+    | 'Feedback Available'
+    | 'Needs Re-recording'
+    | 'Failed';
   averageScore: number | null;
   latestSubmittedAt: Date | null;
   submissions: Submission[];
@@ -51,9 +57,7 @@ export function formatDuration(seconds: number): string {
   return `${String(mins).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
 }
 
-export function calculateAssignmentAverageForSubmissions(
-  subs: Submission[]
-): {
+export function calculateAssignmentAverageForSubmissions(subs: Submission[]): {
   average: number | null;
   assessedCount: number;
   hasPending: boolean;
@@ -177,6 +181,39 @@ export function identifyWeakestCriterion(subs: Submission[]): {
   return entries[0];
 }
 
+export function submissionBelongsToStudent(
+  sub: Submission,
+  student: {
+    key: string;
+    uid: string;
+    studentId: string;
+    email: string;
+  }
+): boolean {
+  if (student.uid && (sub.canonicalStudentUid === student.uid || sub.studentUid === student.uid)) {
+    return true;
+  }
+  if (student.key && (sub.canonicalStudentUid === student.key || sub.studentUid === student.key)) {
+    return true;
+  }
+  if (
+    student.studentId &&
+    student.studentId !== '—' &&
+    sub.studentId &&
+    sub.studentId.trim().toLowerCase() === student.studentId.trim().toLowerCase()
+  ) {
+    return true;
+  }
+  if (
+    student.email &&
+    sub.studentEmail &&
+    sub.studentEmail.trim().toLowerCase() === student.email.trim().toLowerCase()
+  ) {
+    return true;
+  }
+  return false;
+}
+
 export function buildRosterAndUserDirectory(
   roster: StudentRosterEntry[],
   users: UserProfile[]
@@ -203,13 +240,14 @@ export function buildRosterAndUserDirectory(
   >();
 
   for (const r of roster) {
-    const emailKey = r.email.toLowerCase();
-    map.set(emailKey, {
-      key: r.linkedUid || emailKey,
-      uid: r.linkedUid || '',
+    const canonicalKey = r.linkedUid || r.rosterId;
+    const emailClean = (r.email || '').trim().toLowerCase();
+    map.set(canonicalKey, {
+      key: canonicalKey,
+      uid: canonicalKey,
       studentId: r.studentId,
       fullName: r.fullName,
-      email: emailKey,
+      email: emailClean,
       className: r.className,
       accountStatus: r.accountStatus,
     });
@@ -217,19 +255,30 @@ export function buildRosterAndUserDirectory(
 
   for (const u of users) {
     if (u.role !== 'student') continue;
-    const emailKey = u.email.toLowerCase();
-    const existing = map.get(emailKey);
-    if (existing) {
-      map.set(emailKey, {
+    const emailKey = (u.email || '').trim().toLowerCase();
+    const stuIdLower = (u.studentId || '').trim().toLowerCase();
+
+    const matchedKey = Array.from(map.entries()).find(([, entry]) => {
+      if (entry.uid === u.userId) return true;
+      if (emailKey && entry.email && entry.email === emailKey) return true;
+      if (stuIdLower && entry.studentId && entry.studentId.trim().toLowerCase() === stuIdLower) {
+        return true;
+      }
+      return false;
+    })?.[0];
+
+    if (matchedKey) {
+      const existing = map.get(matchedKey)!;
+      map.set(matchedKey, {
         ...existing,
-        key: u.userId,
-        uid: u.userId,
-        studentId: u.studentId || existing.studentId,
-        fullName: u.fullName || existing.fullName,
-        className: u.className || existing.className,
+        uid: existing.uid || u.userId,
+        studentId: existing.studentId || u.studentId,
+        fullName: existing.fullName || u.fullName,
+        className: existing.className || u.className,
+        email: existing.email || emailKey,
       });
     } else {
-      map.set(emailKey, {
+      map.set(u.userId, {
         key: u.userId,
         uid: u.userId,
         studentId: u.studentId || '—',
@@ -255,21 +304,21 @@ export function buildWeeklyStudentSummaries(params: {
     (s) => s.assignmentId === params.assignment.assignmentId
   );
 
-  // Also include any submitting user not yet in the directory
+  // Also include any submitting student not yet in the directory
   const directory = [...params.students];
-  const seenUids = new Set(directory.map((s) => s.uid).filter(Boolean));
-  const seenEmails = new Set(directory.map((s) => s.email.toLowerCase()));
 
   for (const sub of weekSubs) {
-    if (!seenUids.has(sub.studentUid) && !seenEmails.has(sub.studentEmail.toLowerCase())) {
-      seenUids.add(sub.studentUid);
-      seenEmails.add(sub.studentEmail.toLowerCase());
+    const alreadyInDirectory = directory.some((stu) =>
+      submissionBelongsToStudent(sub, stu)
+    );
+    if (!alreadyInDirectory) {
+      const canonical = sub.canonicalStudentUid || sub.studentUid;
       directory.push({
-        key: sub.studentUid,
-        uid: sub.studentUid,
+        key: canonical,
+        uid: canonical,
         studentId: sub.studentId || '—',
         fullName: sub.studentName,
-        email: sub.studentEmail.toLowerCase(),
+        email: (sub.studentEmail || '').toLowerCase(),
         className: sub.className || 'General B1',
         accountStatus: 'active',
       });
@@ -277,15 +326,13 @@ export function buildWeeklyStudentSummaries(params: {
   }
 
   return directory.map((student) => {
-    const stuSubs = weekSubs.filter(
-      (s) =>
-        (student.uid && s.studentUid === student.uid) ||
-        s.studentEmail.toLowerCase() === student.email.toLowerCase()
-    );
+    const stuSubs = weekSubs.filter((s) => submissionBelongsToStudent(s, student));
 
     const totalQuestions = params.assignment.questions.length;
     const completedQuestions = stuSubs.filter(
-      (s) => s.processingStatus === 'feedback_available' || s.processingStatus === 'processing'
+      (s) =>
+        s.processingStatus === 'feedback_available' ||
+        s.processingStatus === 'processing'
     ).length;
 
     let status: WeeklyStudentSummary['status'] = 'Not Started';

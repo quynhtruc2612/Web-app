@@ -1,7 +1,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { signOut } from 'firebase/auth';
 import {
   collection,
+  doc,
   onSnapshot,
   query,
   where,
@@ -20,6 +20,7 @@ import {
   Mic,
   RefreshCw,
   Settings,
+  ShieldCheck,
   Target,
   TrendingUp,
   X,
@@ -41,11 +42,13 @@ import {
 import {
   buildSubmissionId,
   createOrReplaceProcessingSubmission,
+  endStudentSession,
+  getStoredStudentSessionToken,
   initializeStudentProgressCollection,
   markSubmissionProcessingStatus,
   recalculateAndSyncStudentProgress,
+  refreshStudentSessionToken,
   saveSubmissionAssessmentResult,
-  updateOwnStudentProfile,
 } from '../../lib/db';
 import { auth, db, handleFirestoreError, OperationType } from '../../lib/firebase';
 import {
@@ -69,12 +72,12 @@ type StudentTab = 'dashboard' | 'practice' | 'results' | 'history' | 'settings';
 
 interface StudentDashboardProps {
   profile: UserProfile;
-  onProfileUpdated: (updated: UserProfile) => void;
+  onSessionExpired?: () => void;
 }
 
 export const StudentDashboard: React.FC<StudentDashboardProps> = ({
   profile,
-  onProfileUpdated,
+  onSessionExpired,
 }) => {
   const [activeTab, setActiveTab] = useState<StudentTab>('dashboard');
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
@@ -82,6 +85,7 @@ export const StudentDashboard: React.FC<StudentDashboardProps> = ({
   const [assignments, setAssignments] = useState<Assignment[]>([]);
   const [submissions, setSubmissions] = useState<Submission[]>([]);
   const [loading, setLoading] = useState(true);
+  const [exitingSession, setExitingSession] = useState(false);
 
   const [selectedAssignmentId, setSelectedAssignmentId] = useState<string>('');
   const [expandedQuestionId, setExpandedQuestionId] = useState<string | null>(null);
@@ -98,22 +102,6 @@ export const StudentDashboard: React.FC<StudentDashboardProps> = ({
     tone: 'success' | 'error' | 'info';
   } | null>(null);
 
-  // Settings form
-  const [settingsForm, setSettingsForm] = useState({
-    fullName: profile.fullName,
-    studentId: profile.studentId,
-    className: profile.className,
-  });
-  const [savingSettings, setSavingSettings] = useState(false);
-
-  useEffect(() => {
-    setSettingsForm({
-      fullName: profile.fullName,
-      studentId: profile.studentId,
-      className: profile.className,
-    });
-  }, [profile]);
-
   useEffect(() => {
     initializeStudentProgressCollection(profile).catch((err) => {
       console.warn('Could not initialize studentProgress doc:', err);
@@ -121,50 +109,78 @@ export const StudentDashboard: React.FC<StudentDashboardProps> = ({
   }, [profile.userId]);
 
   useEffect(() => {
-    const unsubs: Array<() => void> = [];
-
     // Firestore rule enforces status != 'draft' for students
     const qAssignments = query(
       collection(db, 'assignments'),
       where('status', 'in', ['open', 'locked'])
     );
-    unsubs.push(
-      onSnapshot(
-        qAssignments,
-        (snap) => {
-          const list = snap.docs
-            .map((d) => d.data() as Assignment)
-            .sort((a, b) => b.weekNumber - a.weekNumber);
-          setAssignments(list);
-          setLoading(false);
-        },
-        (err) => handleFirestoreError(err, OperationType.LIST, 'assignments')
-      )
+    const unsub = onSnapshot(
+      qAssignments,
+      (snap) => {
+        const list = snap.docs
+          .map((d) => d.data() as Assignment)
+          .sort((a, b) => b.weekNumber - a.weekNumber);
+        setAssignments(list);
+        setLoading(false);
+      },
+      (err) => handleFirestoreError(err, OperationType.LIST, 'assignments')
     );
 
-    const qSubmissions = query(
-      collection(db, 'submissions'),
-      where('studentUid', '==', profile.userId)
-    );
-    unsubs.push(
+    return () => unsub();
+  }, [profile.userId]);
+
+  // Deterministic per-question document subscriptions (supports cross-session history via allow get without exposing list queries)
+  useEffect(() => {
+    const subIds: string[] = [];
+    for (const assignment of assignments) {
+      for (const q of assignment.questions) {
+        subIds.push(
+          buildSubmissionId(assignment.assignmentId, q.questionId, profile.userId)
+        );
+      }
+    }
+
+    if (subIds.length === 0) {
+      setSubmissions([]);
+      return;
+    }
+
+    const byId = new Map<string, Submission>();
+    const syncState = () => {
+      const sorted = Array.from(byId.values()).sort((a, b) => {
+        const ta = a.submittedAt?.seconds || 0;
+        const tb = b.submittedAt?.seconds || 0;
+        return tb - ta;
+      });
+      setSubmissions(sorted);
+    };
+
+    const unsubs = subIds.map((subId) =>
       onSnapshot(
-        qSubmissions,
+        doc(db, 'submissions', subId),
         (snap) => {
-          const list = snap.docs
-            .map((d) => d.data() as Submission)
-            .sort((a, b) => {
-              const ta = a.submittedAt?.seconds || 0;
-              const tb = b.submittedAt?.seconds || 0;
-              return tb - ta;
-            });
-          setSubmissions(list);
+          if (snap.exists()) {
+            byId.set(subId, snap.data() as Submission);
+          } else {
+            byId.delete(subId);
+          }
+          syncState();
         },
-        (err) => handleFirestoreError(err, OperationType.LIST, 'submissions')
+        (err) => {
+          if (
+            profile.sessionExpiresAt &&
+            Date.now() >= profile.sessionExpiresAt
+          ) {
+            endStudentSession().finally(() => onSessionExpired?.());
+            return;
+          }
+          handleFirestoreError(err, OperationType.GET, `submissions/${subId}`);
+        }
       )
     );
 
     return () => unsubs.forEach((u) => u());
-  }, [profile.userId]);
+  }, [assignments, profile.userId, profile.sessionExpiresAt, onSessionExpired]);
 
   const openAssignment = useMemo(
     () => assignments.find((a) => a.status === 'open') || null,
@@ -259,24 +275,47 @@ export const StudentDashboard: React.FC<StudentDashboardProps> = ({
   }): Promise<AssessmentApiResponse> => {
     const user = auth.currentUser;
     if (!user) {
-      throw new Error('You must be signed in to submit an answer.');
+      throw new Error('Your speaking session has ended. Please re-enter your details.');
     }
     const idToken = await user.getIdToken();
-    const formData = new FormData();
-    formData.append('audio', params.blob, 'speaking-answer.webm');
-    formData.append('questionPrompt', params.questionPrompt);
-    formData.append('weekTitle', params.weekTitle);
-    formData.append('speakingTopic', params.speakingTopic);
-    formData.append('recordingDuration', String(params.recordingDuration));
-    formData.append('mimeType', params.mimeType);
+    let sessionToken =
+      getStoredStudentSessionToken() || (await refreshStudentSessionToken());
 
-    const response = await fetch('/api/assess', {
+    const buildFormData = () => {
+      const formData = new FormData();
+      formData.append('audio', params.blob, 'speaking-answer.webm');
+      formData.append('questionPrompt', params.questionPrompt);
+      formData.append('weekTitle', params.weekTitle);
+      formData.append('speakingTopic', params.speakingTopic);
+      formData.append('recordingDuration', String(params.recordingDuration));
+      formData.append('mimeType', params.mimeType);
+      return formData;
+    };
+
+    let response = await fetch('/api/assess', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${idToken}`,
+        'X-Student-Session': sessionToken,
       },
-      body: formData,
+      body: buildFormData(),
     });
+
+    if (response.status === 401) {
+      try {
+        sessionToken = await refreshStudentSessionToken();
+        response = await fetch('/api/assess', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${idToken}`,
+            'X-Student-Session': sessionToken,
+          },
+          body: buildFormData(),
+        });
+      } catch {
+        // Let original error response surface below
+      }
+    }
 
     const data = await response.json();
     if (!response.ok) {
@@ -451,29 +490,13 @@ export const StudentDashboard: React.FC<StudentDashboardProps> = ({
     }
   };
 
-  const handleSaveSettings = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!settingsForm.fullName.trim()) return;
-    setSavingSettings(true);
+  const handleExitSession = async () => {
+    if (exitingSession) return;
+    setExitingSession(true);
     try {
-      await updateOwnStudentProfile(profile.userId, settingsForm);
-      onProfileUpdated({
-        ...profile,
-        fullName: settingsForm.fullName.trim(),
-        studentId: settingsForm.studentId.trim(),
-        className: settingsForm.className.trim(),
-      });
-      setBannerNotice({
-        message: 'Your profile details have been saved.',
-        tone: 'success',
-      });
-    } catch (err: any) {
-      setBannerNotice({
-        message: err?.message || 'Unable to update profile.',
-        tone: 'error',
-      });
+      await endStudentSession();
     } finally {
-      setSavingSettings(false);
+      setExitingSession(false);
     }
   };
 
@@ -483,18 +506,19 @@ export const StudentDashboard: React.FC<StudentDashboardProps> = ({
         <div className="max-w-md rounded-xl border border-slate-200 bg-white p-8 text-center shadow-sm">
           <AlertCircle className="mx-auto h-10 w-10 text-amber-600" />
           <h1 className="mt-4 text-xl font-bold text-slate-900">
-            Account Deactivated
+            Student Record Deactivated
           </h1>
           <p className="mt-2 text-sm text-slate-600">
-            Your student account ({profile.email}) is currently inactive. Please contact your teacher to reactivate access.
+            Your student record ({profile.studentId}) is currently inactive. Please contact your teacher to reactivate access.
           </p>
           <button
             type="button"
-            onClick={() => signOut(auth)}
-            className="mt-6 inline-flex min-h-[42px] items-center gap-2 rounded-lg bg-slate-900 px-5 py-2 text-sm font-semibold text-white hover:bg-slate-800"
+            onClick={handleExitSession}
+            disabled={exitingSession}
+            className="mt-6 inline-flex min-h-[42px] items-center gap-2 rounded-lg bg-slate-900 px-5 py-2 text-sm font-semibold text-white hover:bg-slate-800 disabled:opacity-50"
           >
             <LogOut className="h-4 w-4" />
-            Sign Out
+            Exit Session
           </button>
         </div>
       </div>
@@ -603,14 +627,24 @@ export const StudentDashboard: React.FC<StudentDashboardProps> = ({
             <p className="truncate text-xs text-slate-500">
               {profile.studentId || 'Student'} · {profile.className || 'B1 Learner'}
             </p>
+            {profile.sessionExpiresAt && (
+              <p className="mt-1 text-[11px] text-emerald-700">
+                Verified session · Until{' '}
+                {new Date(profile.sessionExpiresAt).toLocaleTimeString([], {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                })}
+              </p>
+            )}
           </div>
           <button
             type="button"
-            onClick={() => signOut(auth)}
-            className="flex w-full items-center justify-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 whitespace-nowrap"
+            onClick={handleExitSession}
+            disabled={exitingSession}
+            className="flex w-full items-center justify-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap"
           >
             <LogOut className="h-3.5 w-3.5" />
-            Sign Out
+            {exitingSession ? 'Exiting...' : 'Exit Session'}
           </button>
         </div>
       </aside>
@@ -633,19 +667,30 @@ export const StudentDashboard: React.FC<StudentDashboardProps> = ({
               </h1>
             </div>
 
-            {openAssignment && activeTab !== 'practice' && (
+            <div className="flex items-center gap-2.5">
+              {openAssignment && activeTab !== 'practice' && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSelectedAssignmentId(openAssignment.assignmentId);
+                    setActiveTab('practice');
+                  }}
+                  className="inline-flex min-h-[40px] items-center gap-2 rounded-lg bg-blue-700 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-800 whitespace-nowrap shrink-0"
+                >
+                  <Mic className="h-4 w-4" />
+                  Practice Week {String(openAssignment.weekNumber).padStart(2, '0')}
+                </button>
+              )}
               <button
                 type="button"
-                onClick={() => {
-                  setSelectedAssignmentId(openAssignment.assignmentId);
-                  setActiveTab('practice');
-                }}
-                className="inline-flex min-h-[40px] items-center gap-2 rounded-lg bg-blue-700 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-800 whitespace-nowrap shrink-0"
+                onClick={handleExitSession}
+                disabled={exitingSession}
+                className="inline-flex min-h-[40px] items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap shrink-0"
               >
-                <Mic className="h-4 w-4" />
-                Practice Week {String(openAssignment.weekNumber).padStart(2, '0')}
+                <LogOut className="h-3.5 w-3.5" />
+                <span className="hidden sm:inline">Exit Session</span>
               </button>
-            )}
+            </div>
           </div>
         </header>
 
@@ -1469,97 +1514,79 @@ export const StudentDashboard: React.FC<StudentDashboardProps> = ({
               {/* 5. ACCOUNT SETTINGS */}
               {activeTab === 'settings' && (
                 <div className="max-w-xl space-y-6">
-                  <form
-                    onSubmit={handleSaveSettings}
-                    className="rounded-xl border border-slate-200 bg-white p-6"
-                  >
-                    <h2 className="text-base font-semibold text-slate-900">
-                      Student Profile
-                    </h2>
-                    <div className="mt-4 space-y-4">
+                  <div className="rounded-xl border border-slate-200 bg-white p-6">
+                    <div className="flex items-center justify-between border-b border-slate-100 pb-3">
                       <div>
-                        <label className="block text-xs font-semibold text-slate-700">
-                          Google Email
-                        </label>
-                        <input
-                          type="text"
-                          disabled
-                          value={profile.email}
-                          className="mt-1 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-500"
-                        />
+                        <h2 className="text-base font-semibold text-slate-900">
+                          Verified Student Session
+                        </h2>
+                        <p className="text-xs text-slate-500">
+                          Matched against your teacher&apos;s student list
+                        </p>
                       </div>
-                      <div>
-                        <label className="block text-xs font-semibold text-slate-700">
-                          Full Name
-                        </label>
-                        <input
-                          type="text"
-                          required
-                          value={settingsForm.fullName}
-                          onChange={(e) =>
-                            setSettingsForm((p) => ({
-                              ...p,
-                              fullName: e.target.value,
-                            }))
-                          }
-                          className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
-                        />
-                      </div>
-                      <div className="grid grid-cols-2 gap-3">
-                        <div>
-                          <label className="block text-xs font-semibold text-slate-700">
-                            Student ID
-                          </label>
-                          <input
-                            type="text"
-                            value={settingsForm.studentId}
-                            onChange={(e) =>
-                              setSettingsForm((p) => ({
-                                ...p,
-                                studentId: e.target.value,
-                              }))
-                            }
-                            placeholder="e.g., B1-001"
-                            className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
-                          />
-                        </div>
-                        <div>
-                          <label className="block text-xs font-semibold text-slate-700">
-                            Class / Group
-                          </label>
-                          <input
-                            type="text"
-                            value={settingsForm.className}
-                            onChange={(e) =>
-                              setSettingsForm((p) => ({
-                                ...p,
-                                className: e.target.value,
-                              }))
-                            }
-                            placeholder="e.g., B1-Morning"
-                            className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
-                          />
-                        </div>
-                      </div>
+                      <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-emerald-700">
+                        <ShieldCheck className="h-4 w-4" />
+                        Active
+                      </span>
                     </div>
 
-                    <div className="mt-6 flex justify-end">
+                    <dl className="mt-4 space-y-3 text-sm">
+                      <div className="flex justify-between border-b border-slate-100 pb-2.5">
+                        <dt className="text-slate-500">Full Name</dt>
+                        <dd className="font-semibold text-slate-900">
+                          {profile.fullName}
+                        </dd>
+                      </div>
+                      <div className="flex justify-between border-b border-slate-100 pb-2.5">
+                        <dt className="text-slate-500">Student ID</dt>
+                        <dd className="font-mono font-semibold text-slate-900">
+                          {profile.studentId}
+                        </dd>
+                      </div>
+                      <div className="flex justify-between border-b border-slate-100 pb-2.5">
+                        <dt className="text-slate-500">Class</dt>
+                        <dd className="font-medium text-slate-900">
+                          {profile.className}
+                        </dd>
+                      </div>
+                      <div className="flex justify-between">
+                        <dt className="text-slate-500">Session Expires</dt>
+                        <dd className="text-slate-700">
+                          {profile.sessionExpiresAt
+                            ? new Date(profile.sessionExpiresAt).toLocaleString([], {
+                                month: 'short',
+                                day: 'numeric',
+                                hour: '2-digit',
+                                minute: '2-digit',
+                              })
+                            : '4 hours from sign-in'}
+                        </dd>
+                      </div>
+                    </dl>
+
+                    <p className="mt-4 rounded-lg bg-slate-50 p-3 text-xs leading-relaxed text-slate-600">
+                      To prevent impersonation, Student ID and Class details are managed by your teacher and cannot be edited here. If you notice a mistake, ask your teacher to update the class roster.
+                    </p>
+
+                    <div className="mt-5 flex justify-end">
                       <button
-                        type="submit"
-                        disabled={savingSettings}
-                        className="min-h-[40px] rounded-lg bg-blue-700 px-5 py-2 text-sm font-semibold text-white hover:bg-blue-800 disabled:opacity-50"
+                        type="button"
+                        onClick={handleExitSession}
+                        disabled={exitingSession}
+                        className="inline-flex min-h-[40px] items-center gap-2 rounded-lg border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-800 hover:bg-slate-50 disabled:opacity-50"
                       >
-                        {savingSettings ? 'Saving...' : 'Save Profile'}
+                        <LogOut className="h-4 w-4" />
+                        {exitingSession ? 'Exiting Session...' : 'Exit Practice Session'}
                       </button>
                     </div>
-                  </form>
+                  </div>
 
                   <div className="rounded-xl border border-slate-200 bg-white p-6 text-sm text-slate-600">
                     <h3 className="font-semibold text-slate-900">
-                      Privacy & Audio Storage
+                      Privacy &amp; Audio Storage
                     </h3>
                     <p className="mt-2 leading-relaxed">
-                      Your voice recordings, transcripts, and AI feedback are private to your account and visible only to you and your authorized teacher. Other students cannot access your scores or audio recordings.
+                      Your voice recordings, transcripts, and AI feedback are isolated to your verified Student ID session and visible only to you and your authorized teacher. Other students cannot access your scores or audio recordings.
                     </p>
                   </div>
                 </div>

@@ -16,6 +16,7 @@ import {
   buildWeeklyStudentSummaries,
   computeCriterionAverages,
   formatDateShort,
+  submissionBelongsToStudent,
 } from '../../lib/stats';
 import type {
   Assignment,
@@ -48,7 +49,7 @@ export const TeacherAnalyticsView: React.FC<TeacherAnalyticsViewProps> = ({
   const [classFilter, setClassFilter] = useState<string>('all');
   const [statusFilter, setStatusFilter] = useState<string>('all');
   const [assignmentStatusFilter, setAssignmentStatusFilter] = useState<string>('all');
-  const [selectedStudentEmail, setSelectedStudentEmail] = useState<string>('all');
+  const [selectedStudentKey, setSelectedStudentKey] = useState<string>('all');
 
   const directory = useMemo(
     () => buildRosterAndUserDirectory(roster, users),
@@ -89,25 +90,20 @@ export const TeacherAnalyticsView: React.FC<TeacherAnalyticsViewProps> = ({
   const filteredStudents = useMemo(() => {
     return directory.filter((s) => {
       if (classFilter !== 'all' && s.className !== classFilter) return false;
-      if (
-        selectedStudentEmail !== 'all' &&
-        s.email.toLowerCase() !== selectedStudentEmail.toLowerCase()
-      )
+      if (selectedStudentKey !== 'all' && s.key !== selectedStudentKey)
         return false;
       return true;
     });
-  }, [directory, classFilter, selectedStudentEmail]);
+  }, [directory, classFilter, selectedStudentKey]);
 
   const filteredSubmissions = useMemo(() => {
     const allowedAssignmentIds = new Set(
       filteredAssignments.map((a) => a.assignmentId)
     );
-    const allowedEmails = new Set(
-      filteredStudents.map((s) => s.email.toLowerCase())
-    );
     return submissions.filter((s) => {
       if (!allowedAssignmentIds.has(s.assignmentId)) return false;
-      if (!allowedEmails.has(s.studentEmail.toLowerCase())) return false;
+      if (!filteredStudents.some((stu) => submissionBelongsToStudent(s, stu)))
+        return false;
       if (statusFilter !== 'all' && s.processingStatus !== statusFilter)
         return false;
       return true;
@@ -311,13 +307,13 @@ export const TeacherAnalyticsView: React.FC<TeacherAnalyticsViewProps> = ({
               Student
             </label>
             <select
-              value={selectedStudentEmail}
-              onChange={(e) => setSelectedStudentEmail(e.target.value)}
+              value={selectedStudentKey}
+              onChange={(e) => setSelectedStudentKey(e.target.value)}
               className="mt-1 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-800"
             >
               <option value="all">All Students</option>
               {directory.map((s) => (
-                <option key={s.email} value={s.email}>
+                <option key={s.key} value={s.key}>
                   {s.fullName} ({s.studentId})
                 </option>
               ))}
@@ -513,18 +509,17 @@ export const TeacherAnalyticsView: React.FC<TeacherAnalyticsViewProps> = ({
                 </tr>
               ) : (
                 filteredStudents.map((stu) => {
-                  const stuSubs = filteredSubmissions.filter(
-                    (s) =>
-                      (stu.uid && s.studentUid === stu.uid) ||
-                      s.studentEmail.toLowerCase() === stu.email.toLowerCase()
+                  const stuSubs = filteredSubmissions.filter((s) =>
+                    submissionBelongsToStudent(s, stu)
                   );
                   const avgs = computeCriterionAverages(stuSubs);
                   return (
-                    <tr key={stu.email} className="hover:bg-slate-50/80">
+                    <tr key={stu.key} className="hover:bg-slate-50/80">
                       <td className="py-3 pr-4">
                         <p className="font-medium text-slate-900">{stu.fullName}</p>
                         <p className="text-xs text-slate-500 tabular-nums">
-                          {stu.studentId} · {stu.email}
+                          {stu.studentId}
+                          {stu.email ? ` · ${stu.email}` : ''}
                         </p>
                       </td>
                       <td className="py-3 pr-4 text-slate-600">{stu.className}</td>
@@ -555,7 +550,7 @@ export const TeacherAnalyticsView: React.FC<TeacherAnalyticsViewProps> = ({
                             type="button"
                             onClick={() =>
                               onInspectStudent(
-                                stu.uid || stu.email,
+                                stu.key,
                                 activeWeekForOverview.assignmentId
                               )
                             }

@@ -4,7 +4,12 @@ import { AlertTriangle, RefreshCw } from 'lucide-react';
 import { AuthScreen } from './components/AuthScreen';
 import { StudentDashboard } from './components/student/StudentDashboard';
 import { TeacherDashboard } from './components/teacher/TeacherDashboard';
-import { initializeFirestoreCollections } from './lib/db';
+import {
+  clearStoredStudentSessionToken,
+  ensureTeacherProfile,
+  getActiveStudentLoginPromise,
+  resumeVerifiedStudentSession,
+} from './lib/db';
 import { auth } from './lib/firebase';
 import type { UserProfile } from './types';
 
@@ -13,18 +18,64 @@ export default function App() {
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [bootError, setBootError] = useState<string | null>(null);
+  const [authNotice, setAuthNotice] = useState<string | null>(null);
 
-  const loadProfile = async (user: User) => {
+  const loadSessionForUser = async (user: User) => {
     setBootError(null);
+
+    if (user.isAnonymous) {
+      const inFlight = getActiveStudentLoginPromise();
+      if (inFlight) {
+        try {
+          const prof = await inFlight;
+          setProfile(prof);
+          setAuthNotice(null);
+        } catch {
+          // Error is displayed directly by AuthScreen; ensure clean state
+          setProfile(null);
+        }
+        return;
+      }
+
+      try {
+        const resumed = await resumeVerifiedStudentSession(user);
+        if (resumed) {
+          setProfile(resumed);
+          setAuthNotice(null);
+        } else {
+          clearStoredStudentSessionToken();
+          await signOut(auth).catch(() => {});
+          setProfile(null);
+        }
+      } catch (err: any) {
+        clearStoredStudentSessionToken();
+        await signOut(auth).catch(() => {});
+        setProfile(null);
+        setAuthNotice(
+          err instanceof Error
+            ? err.message
+            : 'Your student session expired. Please enter your details again.'
+        );
+      }
+      return;
+    }
+
+    // Google Sign-In is restricted strictly to authorized Teachers
     try {
-      const { profile: prof } = await initializeFirestoreCollections(user);
-      setProfile(prof);
+      const teacherProfile = await ensureTeacherProfile(user);
+      setProfile(teacherProfile);
+      setAuthNotice(null);
     } catch (err: any) {
-      setBootError(
-        err instanceof Error
-          ? err.message
-          : 'Unable to load your account profile from Firestore.'
-      );
+      const msg = err instanceof Error ? err.message : '';
+      if (msg === 'TEACHER_ACCESS_REQUIRED') {
+        await signOut(auth).catch(() => {});
+        setProfile(null);
+        setAuthNotice(
+          'Google sign-in is reserved for teachers only. Students should enter their Full Name, Student ID, and Class below.'
+        );
+      } else {
+        setBootError(msg || 'Unable to load your teacher account from Firestore.');
+      }
     }
   };
 
@@ -32,7 +83,7 @@ export default function App() {
     const unsub = onAuthStateChanged(auth, async (user) => {
       setFirebaseUser(user);
       if (user) {
-        await loadProfile(user);
+        await loadSessionForUser(user);
       } else {
         setProfile(null);
         setBootError(null);
@@ -54,7 +105,16 @@ export default function App() {
   }
 
   if (!firebaseUser) {
-    return <AuthScreen />;
+    return (
+      <AuthScreen
+        externalError={authNotice}
+        onClearExternalError={() => setAuthNotice(null)}
+        onStudentAuthenticated={(prof) => {
+          setProfile(prof);
+          setAuthNotice(null);
+        }}
+      />
+    );
   }
 
   if (bootError) {
@@ -80,7 +140,7 @@ export default function App() {
             </button>
             <button
               type="button"
-              onClick={() => loadProfile(firebaseUser)}
+              onClick={() => loadSessionForUser(firebaseUser)}
               className="inline-flex items-center gap-1.5 rounded-lg bg-blue-700 px-4 py-2 text-xs font-semibold text-white hover:bg-blue-800"
             >
               <RefreshCw className="h-3.5 w-3.5" />
@@ -110,7 +170,10 @@ export default function App() {
   return (
     <StudentDashboard
       profile={profile}
-      onProfileUpdated={(updated) => setProfile(updated)}
+      onSessionExpired={() => {
+        setAuthNotice('Your temporary student session has ended. Please enter your details again to continue.');
+        setProfile(null);
+      }}
     />
   );
 }

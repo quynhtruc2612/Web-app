@@ -1,19 +1,20 @@
+import { signInAnonymously, signOut, type User } from 'firebase/auth';
 import {
   collection,
   deleteDoc,
   doc,
   getDoc,
   getDocs,
-  limit,
   query,
   serverTimestamp,
   setDoc,
+  Timestamp,
   updateDoc,
   where,
   writeBatch,
 } from 'firebase/firestore';
-import type { User } from 'firebase/auth';
 import {
+  auth,
   BOOTSTRAPPED_TEACHER_EMAIL,
   db,
   handleFirestoreError,
@@ -24,9 +25,12 @@ import type {
   AssessmentApiResponse,
   Assignment,
   AssignmentStatus,
+  PublicClassCatalog,
   SpeakingQuestion,
   StudentProgress,
   StudentRosterEntry,
+  StudentSession,
+  StudentVerificationRecord,
   Submission,
   UserProfile,
 } from '../types';
@@ -37,7 +41,13 @@ export const FIRESTORE_COLLECTIONS = {
   SUBMISSIONS: 'submissions',
   STUDENT_PROGRESS: 'studentProgress',
   STUDENT_ROSTER: 'studentRoster',
+  STUDENT_VERIFICATION: 'studentVerification',
+  STUDENT_SESSIONS: 'studentSessions',
+  PUBLIC_CONFIG: 'publicConfig',
 } as const;
+
+const STUDENT_SESSION_TOKEN_KEY = 'b1_speaking_student_session_token';
+const STUDENT_SESSION_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours (within 12h rule limit)
 
 export function makeSafeId(prefix: string): string {
   const rand =
@@ -47,22 +57,60 @@ export function makeSafeId(prefix: string): string {
   return `${prefix}_${rand}`.replace(/[^a-zA-Z0-9_-]/g, '');
 }
 
+export function normalizeSpaceText(val: string): string {
+  return val.trim().replace(/\s+/g, ' ');
+}
+
+export function normalizeStudentIdKey(studentId: string): string {
+  return studentId
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9_-]/g, '_')
+    .slice(0, 40);
+}
+
+export function isValidStudentIdKey(key: string): boolean {
+  return /^[A-Z0-9_-]{1,40}$/.test(key) && /[A-Z0-9]/.test(key);
+}
+
 export function buildSubmissionId(
   assignmentId: string,
   questionId: string,
   studentUid: string
 ): string {
-  const clean = `${assignmentId}__${questionId}__${studentUid}`.replace(
-    /[^a-zA-Z0-9_-]/g,
-    '_'
-  );
-  return clean.slice(0, 128);
+  const cleanUid = studentUid.replace(/[^a-zA-Z0-9_-]/g, '_');
+  const suffix = `__${cleanUid}`;
+  const cleanPrefix = `${assignmentId}__${questionId}`
+    .replace(/[^a-zA-Z0-9_-]/g, '_')
+    .slice(0, Math.max(1, 128 - suffix.length));
+  return `${cleanPrefix}${suffix}`.slice(0, 128);
 }
 
-export async function ensureUserProfile(authUser: User): Promise<UserProfile> {
+export function computeUniqueClassList(
+  entries: Array<{ className: string }>
+): string[] {
+  const byLower = new Map<string, string>();
+  for (const item of entries) {
+    const clean = normalizeSpaceText(item.className || '').slice(0, 60);
+    if (!clean) continue;
+    const lower = clean.toLowerCase();
+    if (!byLower.has(lower)) {
+      byLower.set(lower, clean);
+    }
+  }
+  return Array.from(byLower.values())
+    .sort((a, b) => a.localeCompare(b))
+    .slice(0, 100);
+}
+
+// ---------------- TEACHER AUTH PROFILE ----------------
+
+export async function ensureTeacherProfile(authUser: User): Promise<UserProfile> {
   const userPath = `users/${authUser.uid}`;
   const email = (authUser.email || '').trim().toLowerCase();
-  const isBootstrappedTeacher = email === BOOTSTRAPPED_TEACHER_EMAIL.toLowerCase();
+  const isBootstrappedTeacher =
+    Boolean(authUser.emailVerified) &&
+    email === BOOTSTRAPPED_TEACHER_EMAIL.toLowerCase();
 
   let existingSnap;
   try {
@@ -73,54 +121,24 @@ export async function ensureUserProfile(authUser: User): Promise<UserProfile> {
 
   if (existingSnap.exists()) {
     const profile = existingSnap.data() as UserProfile;
-    // Sync roster info if student hasn't linked yet or status was updated by teacher
-    if (profile.role === 'student' && email) {
-      const rosterMatch = await findRosterByEmail(email);
-      if (rosterMatch) {
-        if (!rosterMatch.linkedUid) {
-          try {
-            await updateDoc(doc(db, 'studentRoster', rosterMatch.rosterId), {
-              linkedUid: authUser.uid,
-              updatedAt: serverTimestamp(),
-            });
-          } catch (err) {
-            console.warn('Could not auto-link roster UID:', err);
-          }
-        }
-        if (rosterMatch.accountStatus !== profile.accountStatus) {
-          return {
-            ...profile,
-            studentId: profile.studentId || rosterMatch.studentId,
-            className: profile.className || rosterMatch.className,
-            accountStatus: rosterMatch.accountStatus,
-          };
-        }
-      }
+    if (profile.role !== 'teacher' || profile.accountStatus !== 'active') {
+      throw new Error('TEACHER_ACCESS_REQUIRED');
     }
     return profile;
   }
 
-  // Check if teacher pre-created this student in studentRoster
-  let rosterMatch: StudentRosterEntry | null = null;
-  if (!isBootstrappedTeacher && email) {
-    rosterMatch = await findRosterByEmail(email);
+  if (!isBootstrappedTeacher) {
+    throw new Error('TEACHER_ACCESS_REQUIRED');
   }
 
-  const newProfile: Record<string, any> = {
+  const newProfile = {
     userId: authUser.uid,
-    fullName: (
-      rosterMatch?.fullName ||
-      authUser.displayName ||
-      email.split('@')[0] ||
-      'English Learner'
-    ).slice(0, 120),
+    fullName: (authUser.displayName || email.split('@')[0] || 'Teacher').slice(0, 120),
     email: email.slice(0, 200),
-    role: isBootstrappedTeacher ? 'teacher' : 'student',
-    studentId: (rosterMatch?.studentId || '').slice(0, 40),
-    className: (rosterMatch?.className || '').slice(0, 60),
-    accountStatus: isBootstrappedTeacher
-      ? 'active'
-      : rosterMatch?.accountStatus || 'active',
+    role: 'teacher' as const,
+    studentId: '',
+    className: '',
+    accountStatus: 'active' as const,
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp(),
   };
@@ -131,52 +149,271 @@ export async function ensureUserProfile(authUser: User): Promise<UserProfile> {
     handleFirestoreError(error, OperationType.CREATE, userPath);
   }
 
-  if (rosterMatch && !rosterMatch.linkedUid) {
-    try {
-      await updateDoc(doc(db, 'studentRoster', rosterMatch.rosterId), {
-        linkedUid: authUser.uid,
-        updatedAt: serverTimestamp(),
-      });
-    } catch (err) {
-      console.warn('Roster link failed:', err);
-    }
-  }
-
   const createdSnap = await getDoc(doc(db, 'users', authUser.uid));
   return createdSnap.data() as UserProfile;
 }
 
-async function findRosterByEmail(email: string): Promise<StudentRosterEntry | null> {
+export async function ensureUserProfile(authUser: User): Promise<UserProfile> {
+  return ensureTeacherProfile(authUser);
+}
+
+// ---------------- PUBLIC CLASS LIST & VERIFIED STUDENT SESSIONS ----------------
+
+export async function fetchPublicClassList(): Promise<string[]> {
   try {
-    const q = query(
-      collection(db, 'studentRoster'),
-      where('email', '==', email.toLowerCase()),
-      limit(1)
-    );
-    const snap = await getDocs(q);
-    if (snap.empty) return null;
-    return snap.docs[0].data() as StudentRosterEntry;
-  } catch (error) {
-    console.warn('Roster lookup error:', error);
+    const snap = await getDoc(doc(db, FIRESTORE_COLLECTIONS.PUBLIC_CONFIG, 'classes'));
+    if (!snap.exists()) return [];
+    const data = snap.data() as PublicClassCatalog;
+    if (!Array.isArray(data?.classNames)) return [];
+    return data.classNames
+      .map((c) => normalizeSpaceText(String(c || '')))
+      .filter(Boolean)
+      .sort((a, b) => a.localeCompare(b));
+  } catch (err) {
+    console.warn('Could not load class catalog:', err);
+    return [];
+  }
+}
+
+export function getStoredStudentSessionToken(): string | null {
+  try {
+    return window.sessionStorage.getItem(STUDENT_SESSION_TOKEN_KEY);
+  } catch {
     return null;
   }
 }
 
-export async function updateOwnStudentProfile(
-  userId: string,
-  updates: { fullName: string; studentId: string; className: string }
-): Promise<void> {
-  const path = `users/${userId}`;
+function saveStoredStudentSessionToken(token: string): void {
   try {
-    await updateDoc(doc(db, 'users', userId), {
-      fullName: updates.fullName.trim().slice(0, 120),
-      studentId: updates.studentId.trim().slice(0, 40),
-      className: updates.className.trim().slice(0, 60),
-      updatedAt: serverTimestamp(),
-    });
-  } catch (error) {
-    handleFirestoreError(error, OperationType.UPDATE, path);
+    window.sessionStorage.setItem(STUDENT_SESSION_TOKEN_KEY, token);
+  } catch {
+    // ignore storage errors
   }
+}
+
+export function clearStoredStudentSessionToken(): void {
+  try {
+    window.sessionStorage.removeItem(STUDENT_SESSION_TOKEN_KEY);
+  } catch {
+    // ignore storage errors
+  }
+}
+
+async function mintBackendStudentSessionToken(authUser: User): Promise<{
+  sessionToken: string;
+  expiresAt: number;
+  student: {
+    canonicalStudentUid: string;
+    studentId: string;
+    fullName: string;
+    className: string;
+  };
+}> {
+  const idToken = await authUser.getIdToken();
+  const response = await fetch('/api/student/session', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${idToken}`,
+    },
+    body: JSON.stringify({}),
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data?.sessionToken) {
+    throw new Error(
+      data?.error || 'Unable to verify your student speaking session right now.'
+    );
+  }
+
+  saveStoredStudentSessionToken(data.sessionToken);
+  return data;
+}
+
+export async function refreshStudentSessionToken(): Promise<string> {
+  const user = auth.currentUser;
+  if (!user || !user.isAnonymous) {
+    throw new Error('Your student session is no longer active. Please enter your details again.');
+  }
+  const res = await mintBackendStudentSessionToken(user);
+  return res.sessionToken;
+}
+
+let activeStudentLoginPromise: Promise<UserProfile> | null = null;
+
+export function getActiveStudentLoginPromise(): Promise<UserProfile> | null {
+  return activeStudentLoginPromise;
+}
+
+export async function startVerifiedStudentSession(params: {
+  fullName: string;
+  studentId: string;
+  className: string;
+}): Promise<UserProfile> {
+  const run = async (): Promise<UserProfile> => {
+    const cleanName = normalizeSpaceText(params.fullName).slice(0, 120);
+    const cleanStudentId = params.studentId.trim().slice(0, 40);
+    const cleanClass = normalizeSpaceText(params.className).slice(0, 60);
+    const studentIdKey = normalizeStudentIdKey(cleanStudentId);
+
+    if (!cleanName || !cleanStudentId || !cleanClass) {
+      throw new Error('Please enter your Full Name, Student ID, and select your Class.');
+    }
+    if (!isValidStudentIdKey(studentIdKey)) {
+      throw new Error('Please enter a valid Student ID (letters, numbers, hyphens, or underscores).');
+    }
+
+    clearStoredStudentSessionToken();
+    if (auth.currentUser) {
+      await signOut(auth).catch(() => {});
+    }
+
+    let cred;
+    try {
+      cred = await signInAnonymously(auth);
+    } catch (err: any) {
+      const code = err?.code || '';
+      if (
+        code === 'auth/operation-not-allowed' ||
+        code === 'auth/admin-restricted-operation'
+      ) {
+        throw new Error(
+          'ANONYMOUS_AUTH_DISABLED: Anonymous sign-in is not enabled in Firebase Authentication yet. Ask your teacher/admin to enable the Anonymous sign-in provider in Firebase Console.'
+        );
+      }
+      throw new Error(err?.message || 'Unable to start a temporary student session.');
+    }
+
+    const uid = cred.user.uid;
+    const expiresAtMs = Date.now() + STUDENT_SESSION_TTL_MS;
+
+    try {
+      await setDoc(doc(db, FIRESTORE_COLLECTIONS.STUDENT_SESSIONS, uid), {
+        sessionUid: uid,
+        studentIdKey,
+        studentId: cleanStudentId,
+        fullName: cleanName,
+        fullNameNormalized: cleanName.toLowerCase(),
+        className: cleanClass,
+        classNameNormalized: cleanClass.toLowerCase(),
+        status: 'active',
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+        expiresAt: Timestamp.fromMillis(expiresAtMs),
+      });
+    } catch (err: any) {
+      await signOut(auth).catch(() => {});
+      const msg = String(err?.message || '');
+      if (err?.code === 'permission-denied' || msg.includes('Missing or insufficient permissions')) {
+        throw new Error(
+          'We could not match your Full Name, Student ID, and Class with an active student record. Please check your details or ask your teacher.'
+        );
+      }
+      throw new Error(msg || 'Unable to verify your student record right now.');
+    }
+
+    try {
+      const issued = await mintBackendStudentSessionToken(cred.user);
+      return {
+        userId: issued.student.canonicalStudentUid,
+        authUid: uid,
+        fullName: issued.student.fullName,
+        email: '',
+        role: 'student',
+        studentId: issued.student.studentId,
+        className: issued.student.className,
+        accountStatus: 'active',
+        sessionExpiresAt: issued.expiresAt,
+        createdAt: null,
+        updatedAt: null,
+      };
+    } catch (err) {
+      await signOut(auth).catch(() => {});
+      clearStoredStudentSessionToken();
+      throw err;
+    }
+  };
+
+  const promise = run();
+  activeStudentLoginPromise = promise;
+  try {
+    return await promise;
+  } finally {
+    if (activeStudentLoginPromise === promise) {
+      activeStudentLoginPromise = null;
+    }
+  }
+}
+
+export async function resumeVerifiedStudentSession(
+  authUser: User
+): Promise<UserProfile | null> {
+  if (!authUser.isAnonymous) return null;
+  const path = `${FIRESTORE_COLLECTIONS.STUDENT_SESSIONS}/${authUser.uid}`;
+
+  let snap;
+  try {
+    snap = await getDoc(doc(db, FIRESTORE_COLLECTIONS.STUDENT_SESSIONS, authUser.uid));
+  } catch {
+    return null;
+  }
+
+  if (!snap.exists()) return null;
+  const data = snap.data() as StudentSession;
+  const expiresAtMs =
+    typeof data.expiresAt?.toMillis === 'function'
+      ? data.expiresAt.toMillis()
+      : typeof data.expiresAt?.seconds === 'number'
+      ? data.expiresAt.seconds * 1000
+      : 0;
+
+  if (data.status !== 'active' || expiresAtMs <= Date.now()) {
+    return null;
+  }
+
+  try {
+    const issued = await mintBackendStudentSessionToken(authUser);
+    return {
+      userId: issued.student.canonicalStudentUid,
+      authUid: authUser.uid,
+      fullName: issued.student.fullName,
+      email: '',
+      role: 'student',
+      studentId: issued.student.studentId,
+      className: issued.student.className,
+      accountStatus: 'active',
+      sessionExpiresAt: issued.expiresAt,
+      createdAt: data.createdAt,
+      updatedAt: data.updatedAt,
+    };
+  } catch (err) {
+    console.warn(`Could not resume session at ${path}:`, err);
+    return null;
+  }
+}
+
+export async function endStudentSession(): Promise<void> {
+  const token = getStoredStudentSessionToken();
+  clearStoredStudentSessionToken();
+
+  if (token) {
+    await fetch('/api/student/logout', {
+      method: 'POST',
+      headers: {
+        'X-Student-Session': token,
+      },
+    }).catch(() => {});
+  }
+
+  const currentUser = auth.currentUser;
+  if (currentUser?.isAnonymous) {
+    await updateDoc(doc(db, FIRESTORE_COLLECTIONS.STUDENT_SESSIONS, currentUser.uid), {
+      status: 'ended',
+      updatedAt: serverTimestamp(),
+    }).catch(() => {});
+  }
+
+  await signOut(auth).catch(() => {});
 }
 
 // ---------------- ASSIGNMENTS ----------------
@@ -290,31 +527,194 @@ export async function deleteAssignment(assignmentId: string): Promise<void> {
   }
 }
 
-// ---------------- STUDENT ROSTER ----------------
+// ---------------- STUDENT ROSTER & VERIFICATION SYNC ----------------
+
+function buildVerificationPayload(params: {
+  studentIdKey: string;
+  rosterId: string;
+  studentId: string;
+  fullName: string;
+  className: string;
+  accountStatus: AccountStatus;
+  updatedBy: string;
+}) {
+  const cleanName = normalizeSpaceText(params.fullName).slice(0, 120);
+  const cleanClass = normalizeSpaceText(params.className).slice(0, 60);
+  return {
+    studentIdKey: params.studentIdKey,
+    rosterId: params.rosterId,
+    studentId: params.studentId.trim().slice(0, 40),
+    fullName: cleanName,
+    fullNameNormalized: cleanName.toLowerCase(),
+    className: cleanClass,
+    classNameNormalized: cleanClass.toLowerCase(),
+    accountStatus: params.accountStatus,
+    canonicalStudentUid: `stu_${params.studentIdKey}`,
+    updatedBy: params.updatedBy,
+    updatedAt: serverTimestamp(),
+  };
+}
+
+export async function syncRosterVerificationAndClasses(
+  roster: StudentRosterEntry[],
+  teacherUid: string
+): Promise<void> {
+  try {
+    const [verSnap, classSnap] = await Promise.all([
+      getDocs(collection(db, FIRESTORE_COLLECTIONS.STUDENT_VERIFICATION)),
+      getDoc(doc(db, FIRESTORE_COLLECTIONS.PUBLIC_CONFIG, 'classes')),
+    ]);
+
+    const existingVerByKey = new Map<string, StudentVerificationRecord>();
+    verSnap.docs.forEach((d) => {
+      const rec = d.data() as StudentVerificationRecord;
+      existingVerByKey.set(rec.studentIdKey || d.id, rec);
+    });
+
+    const expectedKeys = new Set<string>();
+    const batch = writeBatch(db);
+    let hasWrites = false;
+
+    for (const r of roster) {
+      const cleanStudentId = r.studentId.trim().slice(0, 40);
+      const studentIdKey = r.studentIdKey || normalizeStudentIdKey(cleanStudentId);
+      if (!isValidStudentIdKey(studentIdKey)) continue;
+      expectedKeys.add(studentIdKey);
+
+      const cleanName = normalizeSpaceText(r.fullName).slice(0, 120);
+      const cleanClass = normalizeSpaceText(r.className || 'General B1').slice(0, 60);
+      if (!cleanName || !cleanClass) continue;
+
+      if (!r.studentIdKey) {
+        batch.update(doc(db, FIRESTORE_COLLECTIONS.STUDENT_ROSTER, r.rosterId), {
+          studentIdKey,
+          fullName: cleanName,
+          className: cleanClass,
+          updatedAt: serverTimestamp(),
+        });
+        hasWrites = true;
+      }
+
+      const existing = existingVerByKey.get(studentIdKey);
+      const needsSync =
+        !existing ||
+        existing.rosterId !== r.rosterId ||
+        existing.studentId !== cleanStudentId ||
+        existing.fullNameNormalized !== cleanName.toLowerCase() ||
+        existing.classNameNormalized !== cleanClass.toLowerCase() ||
+        existing.accountStatus !== r.accountStatus;
+
+      if (needsSync) {
+        batch.set(
+          doc(db, FIRESTORE_COLLECTIONS.STUDENT_VERIFICATION, studentIdKey),
+          buildVerificationPayload({
+            studentIdKey,
+            rosterId: r.rosterId,
+            studentId: cleanStudentId,
+            fullName: cleanName,
+            className: cleanClass,
+            accountStatus: r.accountStatus,
+            updatedBy: teacherUid,
+          })
+        );
+        hasWrites = true;
+      }
+    }
+
+    for (const [key] of existingVerByKey.entries()) {
+      if (!expectedKeys.has(key)) {
+        batch.delete(doc(db, FIRESTORE_COLLECTIONS.STUDENT_VERIFICATION, key));
+        hasWrites = true;
+      }
+    }
+
+    const desiredClasses = computeUniqueClassList(roster);
+    const currentClasses = classSnap.exists()
+      ? ((classSnap.data() as PublicClassCatalog).classNames || [])
+      : null;
+    const classesChanged =
+      !currentClasses ||
+      currentClasses.length !== desiredClasses.length ||
+      currentClasses.some((c, i) => c !== desiredClasses[i]);
+
+    if (classesChanged) {
+      batch.set(doc(db, FIRESTORE_COLLECTIONS.PUBLIC_CONFIG, 'classes'), {
+        classNames: desiredClasses,
+        updatedBy: teacherUid,
+        updatedAt: serverTimestamp(),
+      });
+      hasWrites = true;
+    }
+
+    if (hasWrites) {
+      await batch.commit();
+    }
+  } catch (err) {
+    console.warn('Verification index sync warning:', err);
+  }
+}
 
 export async function addRosterStudent(params: {
   studentId: string;
   fullName: string;
-  email: string;
+  email?: string;
   className: string;
   accountStatus: AccountStatus;
   createdBy: string;
 }): Promise<string> {
+  const cleanStudentId = params.studentId.trim().slice(0, 40);
+  const studentIdKey = normalizeStudentIdKey(cleanStudentId);
+  const cleanName = normalizeSpaceText(params.fullName).slice(0, 120);
+  const cleanClass = normalizeSpaceText(params.className).slice(0, 60);
+  const cleanEmail = (params.email || '').trim().toLowerCase().slice(0, 200);
+
+  if (!cleanStudentId || !isValidStudentIdKey(studentIdKey)) {
+    throw new Error('Please enter a valid Student ID.');
+  }
+  if (!cleanName || !cleanClass) {
+    throw new Error('Full Name and Class are required.');
+  }
+
+  // Enforce unique Student ID
+  const existingVerSnap = await getDoc(
+    doc(db, FIRESTORE_COLLECTIONS.STUDENT_VERIFICATION, studentIdKey)
+  );
+  if (existingVerSnap.exists()) {
+    throw new Error(
+      `Student ID "${cleanStudentId}" is already assigned to another student. Each student must have a unique Student ID.`
+    );
+  }
+
   const rosterId = makeSafeId('roster');
   const path = `studentRoster/${rosterId}`;
   try {
-    await setDoc(doc(db, 'studentRoster', rosterId), {
+    const batch = writeBatch(db);
+    batch.set(doc(db, FIRESTORE_COLLECTIONS.STUDENT_ROSTER, rosterId), {
       rosterId,
-      studentId: params.studentId.trim().slice(0, 40),
-      fullName: params.fullName.trim().slice(0, 120),
-      email: params.email.trim().toLowerCase().slice(0, 200),
-      className: params.className.trim().slice(0, 60),
+      studentId: cleanStudentId,
+      studentIdKey,
+      fullName: cleanName,
+      email: cleanEmail,
+      className: cleanClass,
       accountStatus: params.accountStatus,
       linkedUid: '',
       createdBy: params.createdBy,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
+    batch.set(
+      doc(db, FIRESTORE_COLLECTIONS.STUDENT_VERIFICATION, studentIdKey),
+      buildVerificationPayload({
+        studentIdKey,
+        rosterId,
+        studentId: cleanStudentId,
+        fullName: cleanName,
+        className: cleanClass,
+        accountStatus: params.accountStatus,
+        updatedBy: params.createdBy,
+      })
+    );
+    await batch.commit();
     return rosterId;
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, path);
@@ -325,34 +725,73 @@ export async function bulkImportRosterStudents(
   rows: Array<{
     studentId: string;
     fullName: string;
-    email: string;
+    email?: string;
     className: string;
   }>,
-  createdBy: string
-): Promise<number> {
-  if (rows.length === 0) return 0;
+  createdBy: string,
+  existingRoster: StudentRosterEntry[] = []
+): Promise<{ imported: number; skippedDuplicates: string[] }> {
+  if (rows.length === 0) return { imported: 0, skippedDuplicates: [] };
+
+  const existingKeys = new Set(
+    existingRoster.map((r) => r.studentIdKey || normalizeStudentIdKey(r.studentId))
+  );
+  const skippedDuplicates: string[] = [];
+
   try {
     const batch = writeBatch(db);
     let count = 0;
+
     for (const row of rows.slice(0, 100)) {
-      if (!row.studentId.trim() || !row.fullName.trim() || !row.email.trim()) continue;
+      const cleanStudentId = row.studentId.trim().slice(0, 40);
+      const studentIdKey = normalizeStudentIdKey(cleanStudentId);
+      const cleanName = normalizeSpaceText(row.fullName).slice(0, 120);
+      const cleanClass = normalizeSpaceText(row.className || 'General B1').slice(0, 60);
+      const cleanEmail = (row.email || '').trim().toLowerCase().slice(0, 200);
+
+      if (!cleanStudentId || !isValidStudentIdKey(studentIdKey) || !cleanName) {
+        continue;
+      }
+
+      if (existingKeys.has(studentIdKey)) {
+        skippedDuplicates.push(cleanStudentId);
+        continue;
+      }
+      existingKeys.add(studentIdKey);
+
       const rosterId = makeSafeId('roster');
-      batch.set(doc(db, 'studentRoster', rosterId), {
+      batch.set(doc(db, FIRESTORE_COLLECTIONS.STUDENT_ROSTER, rosterId), {
         rosterId,
-        studentId: row.studentId.trim().slice(0, 40),
-        fullName: row.fullName.trim().slice(0, 120),
-        email: row.email.trim().toLowerCase().slice(0, 200),
-        className: (row.className.trim() || 'General B1').slice(0, 60),
+        studentId: cleanStudentId,
+        studentIdKey,
+        fullName: cleanName,
+        email: cleanEmail,
+        className: cleanClass,
         accountStatus: 'active',
         linkedUid: '',
         createdBy,
         createdAt: serverTimestamp(),
         updatedAt: serverTimestamp(),
       });
+      batch.set(
+        doc(db, FIRESTORE_COLLECTIONS.STUDENT_VERIFICATION, studentIdKey),
+        buildVerificationPayload({
+          studentIdKey,
+          rosterId,
+          studentId: cleanStudentId,
+          fullName: cleanName,
+          className: cleanClass,
+          accountStatus: 'active',
+          updatedBy: createdBy,
+        })
+      );
       count++;
     }
-    await batch.commit();
-    return count;
+
+    if (count > 0) {
+      await batch.commit();
+    }
+    return { imported: count, skippedDuplicates };
   } catch (error) {
     handleFirestoreError(error, OperationType.WRITE, 'studentRoster');
   }
@@ -363,39 +802,118 @@ export async function updateRosterStudent(
   updates: {
     studentId: string;
     fullName: string;
-    email: string;
+    email?: string;
     className: string;
     accountStatus: AccountStatus;
-  }
+  },
+  updatedBy = entry.createdBy
 ): Promise<void> {
   const path = `studentRoster/${entry.rosterId}`;
+  const cleanStudentId = updates.studentId.trim().slice(0, 40);
+  const newKey = normalizeStudentIdKey(cleanStudentId);
+  const oldKey = entry.studentIdKey || normalizeStudentIdKey(entry.studentId);
+  const cleanName = normalizeSpaceText(updates.fullName).slice(0, 120);
+  const cleanClass = normalizeSpaceText(updates.className).slice(0, 60);
+  const cleanEmail = (updates.email || '').trim().toLowerCase().slice(0, 200);
+
+  if (!cleanStudentId || !isValidStudentIdKey(newKey)) {
+    throw new Error('Please enter a valid Student ID.');
+  }
+  if (!cleanName || !cleanClass) {
+    throw new Error('Full Name and Class are required.');
+  }
+
+  if (newKey !== oldKey) {
+    const conflictSnap = await getDoc(
+      doc(db, FIRESTORE_COLLECTIONS.STUDENT_VERIFICATION, newKey)
+    );
+    if (
+      conflictSnap.exists() &&
+      (conflictSnap.data() as StudentVerificationRecord).rosterId !== entry.rosterId
+    ) {
+      throw new Error(
+        `Student ID "${cleanStudentId}" belongs to another student. Please choose a unique Student ID.`
+      );
+    }
+  }
+
   try {
-    await updateDoc(doc(db, 'studentRoster', entry.rosterId), {
-      studentId: updates.studentId.trim().slice(0, 40),
-      fullName: updates.fullName.trim().slice(0, 120),
-      email: updates.email.trim().toLowerCase().slice(0, 200),
-      className: updates.className.trim().slice(0, 60),
+    const batch = writeBatch(db);
+    batch.update(doc(db, FIRESTORE_COLLECTIONS.STUDENT_ROSTER, entry.rosterId), {
+      studentId: cleanStudentId,
+      studentIdKey: newKey,
+      fullName: cleanName,
+      email: cleanEmail,
+      className: cleanClass,
       accountStatus: updates.accountStatus,
       updatedAt: serverTimestamp(),
     });
+
+    if (oldKey && oldKey !== newKey) {
+      batch.delete(doc(db, FIRESTORE_COLLECTIONS.STUDENT_VERIFICATION, oldKey));
+    }
+
+    batch.set(
+      doc(db, FIRESTORE_COLLECTIONS.STUDENT_VERIFICATION, newKey),
+      buildVerificationPayload({
+        studentIdKey: newKey,
+        rosterId: entry.rosterId,
+        studentId: cleanStudentId,
+        fullName: cleanName,
+        className: cleanClass,
+        accountStatus: updates.accountStatus,
+        updatedBy,
+      })
+    );
+
+    await batch.commit();
+
     if (entry.linkedUid) {
       await updateDoc(doc(db, 'users', entry.linkedUid), {
-        studentId: updates.studentId.trim().slice(0, 40),
-        fullName: updates.fullName.trim().slice(0, 120),
-        className: updates.className.trim().slice(0, 60),
+        studentId: cleanStudentId,
+        fullName: cleanName,
+        className: cleanClass,
         accountStatus: updates.accountStatus,
         updatedAt: serverTimestamp(),
-      });
+      }).catch(() => {});
     }
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, path);
   }
 }
 
-export async function deleteRosterStudent(rosterId: string): Promise<void> {
-  const path = `studentRoster/${rosterId}`;
+export async function setRosterStudentStatus(
+  entry: StudentRosterEntry,
+  accountStatus: AccountStatus,
+  updatedBy: string
+): Promise<void> {
+  return updateRosterStudent(
+    entry,
+    {
+      studentId: entry.studentId,
+      fullName: entry.fullName,
+      email: entry.email || '',
+      className: entry.className,
+      accountStatus,
+    },
+    updatedBy
+  );
+}
+
+export async function deleteRosterStudent(
+  entry: StudentRosterEntry
+): Promise<void> {
+  const path = `studentRoster/${entry.rosterId}`;
+  const studentIdKey = entry.studentIdKey || normalizeStudentIdKey(entry.studentId);
   try {
-    await deleteDoc(doc(db, 'studentRoster', rosterId));
+    const batch = writeBatch(db);
+    batch.delete(doc(db, FIRESTORE_COLLECTIONS.STUDENT_ROSTER, entry.rosterId));
+    if (isValidStudentIdKey(studentIdKey)) {
+      batch.delete(
+        doc(db, FIRESTORE_COLLECTIONS.STUDENT_VERIFICATION, studentIdKey)
+      );
+    }
+    await batch.commit();
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, path);
   }
@@ -417,10 +935,18 @@ export async function createOrReplaceProcessingSubmission(params: {
 }): Promise<void> {
   const path = `submissions/${params.submissionId}`;
   const cleanDuration = Math.max(0, Math.min(300, Math.round(params.recordingDuration)));
+  const sessionAuthUid =
+    auth.currentUser?.uid || params.student.authUid || params.student.userId;
+  const canonicalUid = params.student.userId;
 
   if (params.isResubmission) {
     try {
       await updateDoc(doc(db, 'submissions', params.submissionId), {
+        studentUid: sessionAuthUid,
+        canonicalStudentUid: canonicalUid,
+        studentId: (params.student.studentId || '').slice(0, 40),
+        studentName: params.student.fullName.slice(0, 120),
+        className: (params.student.className || 'General B1').slice(0, 60),
         questionPromptSnapshot: params.question.prompt.slice(0, 1500),
         audioStorageType: params.audioStorageType,
         audioStoragePath: params.audioStoragePath.slice(0, 400),
@@ -452,10 +978,11 @@ export async function createOrReplaceProcessingSubmission(params: {
   try {
     await setDoc(doc(db, 'submissions', params.submissionId), {
       submissionId: params.submissionId,
-      studentUid: params.student.userId,
+      studentUid: sessionAuthUid,
+      canonicalStudentUid: canonicalUid,
       studentId: (params.student.studentId || '').slice(0, 40),
       studentName: params.student.fullName.slice(0, 120),
-      studentEmail: params.student.email.slice(0, 200),
+      studentEmail: (params.student.email || '').slice(0, 200),
       className: (params.student.className || 'General B1').slice(0, 60),
       assignmentId: params.assignment.assignmentId,
       weekNumber: params.assignment.weekNumber,
@@ -552,18 +1079,12 @@ export async function setSubmissionResubmissionAllowed(
 
 // ---------------- STUDENT PROGRESS & COLLECTION INITIALIZERS ----------------
 
-/**
- * Initializes the 'users' collection document for an authenticated user.
- */
 export async function initializeUsersCollection(
   authUser: User
 ): Promise<UserProfile> {
-  return ensureUserProfile(authUser);
+  return ensureTeacherProfile(authUser);
 }
 
-/**
- * Initializes a document in the 'assignments' collection.
- */
 export async function initializeAssignmentsCollection(params: {
   weekNumber: number;
   title: string;
@@ -577,9 +1098,6 @@ export async function initializeAssignmentsCollection(params: {
   return createAssignment(params);
 }
 
-/**
- * Initializes a document in the 'submissions' collection.
- */
 export async function initializeSubmissionsCollection(params: {
   submissionId: string;
   isResubmission: boolean;
@@ -595,10 +1113,6 @@ export async function initializeSubmissionsCollection(params: {
   return createOrReplaceProcessingSubmission(params);
 }
 
-/**
- * Initializes the 'studentProgress' collection document for a student with
- * zero counts and null averages (never fabricated default scores).
- */
 export async function initializeStudentProgressCollection(
   student: Pick<UserProfile, 'userId' | 'studentId'>
 ): Promise<StudentProgress> {
@@ -641,10 +1155,6 @@ export async function initializeStudentProgressCollection(
   return createdSnap.data() as StudentProgress;
 }
 
-/**
- * Recalculates and persists a student's 'studentProgress' summary document
- * strictly from real Firestore assignment and submission records.
- */
 export async function recalculateAndSyncStudentProgress(
   student: Pick<UserProfile, 'userId' | 'studentId'>,
   knownAssignments?: Assignment[],
@@ -674,21 +1184,31 @@ export async function recalculateAndSyncStudentProgress(
 
   let submissionsList = knownSubmissions;
   if (!submissionsList) {
-    try {
-      const subSnap = await getDocs(
-        query(
-          collection(db, FIRESTORE_COLLECTIONS.SUBMISSIONS),
-          where('studentUid', '==', student.userId)
-        )
-      );
-      submissionsList = subSnap.docs.map((d) => d.data() as Submission);
-    } catch (error) {
-      handleFirestoreError(
-        error,
-        OperationType.LIST,
-        FIRESTORE_COLLECTIONS.SUBMISSIONS
-      );
+    const resolved: Submission[] = [];
+    for (const week of assignmentsList) {
+      for (const q of week.questions) {
+        const subId = buildSubmissionId(
+          week.assignmentId,
+          q.questionId,
+          student.userId
+        );
+        try {
+          const snap = await getDoc(
+            doc(db, FIRESTORE_COLLECTIONS.SUBMISSIONS, subId)
+          );
+          if (snap.exists()) {
+            resolved.push(snap.data() as Submission);
+          }
+        } catch (error) {
+          handleFirestoreError(
+            error,
+            OperationType.GET,
+            `${FIRESTORE_COLLECTIONS.SUBMISSIONS}/${subId}`
+          );
+        }
+      }
     }
+    submissionsList = resolved;
   }
 
   const publishedAssignments = assignmentsList.filter((a) => a.status !== 'draft');
@@ -764,33 +1284,21 @@ export async function recalculateAndSyncStudentProgress(
   return updatedSnap.data() as StudentProgress;
 }
 
-/**
- * Bootstraps and verifies core Firestore collection records for the signed-in user:
- * 'users', 'studentProgress', and verifies read access to 'assignments' and 'submissions'.
- */
 export async function initializeFirestoreCollections(authUser: User): Promise<{
   profile: UserProfile;
   progress: StudentProgress | null;
   collectionsInitialized: string[];
 }> {
   const profile = await initializeUsersCollection(authUser);
-  const collectionsInitialized: string[] = [FIRESTORE_COLLECTIONS.USERS];
-
-  let progress: StudentProgress | null = null;
-  if (profile.role === 'student') {
-    progress = await initializeStudentProgressCollection(profile);
-    collectionsInitialized.push(FIRESTORE_COLLECTIONS.STUDENT_PROGRESS);
-  }
-
-  collectionsInitialized.push(
+  const collectionsInitialized: string[] = [
+    FIRESTORE_COLLECTIONS.USERS,
     FIRESTORE_COLLECTIONS.ASSIGNMENTS,
-    FIRESTORE_COLLECTIONS.SUBMISSIONS
-  );
+    FIRESTORE_COLLECTIONS.SUBMISSIONS,
+  ];
 
   return {
     profile,
-    progress,
+    progress: null,
     collectionsInitialized,
   };
 }
-

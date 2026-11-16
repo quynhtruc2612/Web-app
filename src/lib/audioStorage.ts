@@ -1,6 +1,7 @@
 import {
   collection,
   doc,
+  getDoc,
   getDocs,
   orderBy,
   query,
@@ -8,7 +9,7 @@ import {
   writeBatch,
 } from 'firebase/firestore';
 import { getDownloadURL, ref, uploadBytes } from 'firebase/storage';
-import { db, handleFirestoreError, OperationType, storage } from './firebase';
+import { auth, db, handleFirestoreError, OperationType, storage } from './firebase';
 import type { Submission } from '../types';
 
 const CHUNK_CHAR_LIMIT = 550000; // safely under Firestore 1MB doc limit and 750k rule cap
@@ -69,14 +70,16 @@ export async function prepareOrUploadAudioToStorage(params: {
   submissionId: string;
 }): Promise<AudioUploadPrepResult> {
   const ext = getFileExtensionForMime(params.mimeType);
-  const storagePath = `recordings/${params.studentUid}/${params.assignmentId}/${params.questionId}/${params.submissionId}.${ext}`;
+  const authUid = auth.currentUser?.uid || params.studentUid;
+  const storagePath = `recordings/${authUid}/${params.assignmentId}/${params.questionId}/${params.submissionId}.${ext}`;
 
   try {
     const storageRef = ref(storage, storagePath);
     const uploadPromise = uploadBytes(storageRef, params.blob, {
       contentType: params.mimeType.split(';')[0] || 'audio/webm',
       customMetadata: {
-        studentUid: params.studentUid,
+        studentUid: authUid,
+        canonicalStudentUid: params.studentUid,
         assignmentId: params.assignmentId,
         questionId: params.questionId,
       },
@@ -123,6 +126,7 @@ export async function writeAudioChunksToFirestore(params: {
   chunks: string[];
 }): Promise<void> {
   const basePath = `submissions/${params.submissionId}/audioChunks`;
+  const authUid = auth.currentUser?.uid || params.studentUid;
   try {
     const batch = writeBatch(db);
     params.chunks.forEach((chunkData, index) => {
@@ -130,7 +134,7 @@ export async function writeAudioChunksToFirestore(params: {
       batch.set(chunkRef, {
         chunkIndex: index,
         data: chunkData,
-        studentUid: params.studentUid,
+        studentUid: authUid,
         createdAt: serverTimestamp(),
       });
     });
@@ -152,15 +156,34 @@ export async function resolveSubmissionAudioUrl(
   if (submission.audioStorageType === 'firestore_chunks') {
     const chunksPath = `submissions/${submission.submissionId}/audioChunks`;
     try {
-      const q = query(collection(db, chunksPath), orderBy('chunkIndex', 'asc'));
-      const snap = await getDocs(q);
       const parts: string[] = [];
-      snap.forEach((d) => {
-        const data = d.data();
-        if (typeof data.data === 'string') {
-          parts.push(data.data);
+
+      if (submission.audioChunkCount > 0) {
+        // Fetch deterministic chunk docs directly via getDoc (uses allow get Master Gate)
+        const snaps = await Promise.all(
+          Array.from({ length: submission.audioChunkCount }, (_, idx) =>
+            getDoc(doc(db, chunksPath, String(idx)))
+          )
+        );
+        for (const snap of snaps) {
+          if (snap.exists()) {
+            const data = snap.data();
+            if (typeof data.data === 'string') {
+              parts.push(data.data);
+            }
+          }
         }
-      });
+      } else {
+        const q = query(collection(db, chunksPath), orderBy('chunkIndex', 'asc'));
+        const snap = await getDocs(q);
+        snap.forEach((d) => {
+          const data = d.data();
+          if (typeof data.data === 'string') {
+            parts.push(data.data);
+          }
+        });
+      }
+
       if (parts.length === 0) {
         throw new Error('No audio recording chunks found for this submission.');
       }

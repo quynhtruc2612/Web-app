@@ -1,10 +1,11 @@
 import 'dotenv/config';
+import crypto from 'crypto';
 import express, { type Request, type Response, type NextFunction } from 'express';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import multer from 'multer';
-import { createRemoteJWKSet, jwtVerify } from 'jose';
+import { createRemoteJWKSet, jwtVerify, SignJWT } from 'jose';
 import { GoogleGenAI, Type } from '@google/genai';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -13,6 +14,8 @@ const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT) || 3000;
 const PROMPT_VERSION = 'b1-pet-v1.0';
 const GEMINI_MODEL = 'gemini-4-hydrogen';
+const BOOTSTRAPPED_TEACHER_EMAIL = 'quynhtruc2612@gmail.com';
+const STUDENT_TOKEN_TTL_SECONDS = 4 * 60 * 60; // 4 hours
 
 interface FirebaseAppletConfig {
   projectId: string;
@@ -21,15 +24,57 @@ interface FirebaseAppletConfig {
 }
 
 let firebaseProjectId = '';
+let firestoreDatabaseId = '(default)';
 try {
   const configPath = path.resolve(__dirname, 'firebase-applet-config.json');
   if (fs.existsSync(configPath)) {
     const raw = fs.readFileSync(configPath, 'utf-8');
     const parsed = JSON.parse(raw) as FirebaseAppletConfig;
     firebaseProjectId = parsed.projectId || '';
+    firestoreDatabaseId = parsed.firestoreDatabaseId || '(default)';
   }
 } catch (err) {
   console.error('Failed to read firebase-applet-config.json:', err);
+}
+
+// Server-only HMAC signing key for short-lived student session tokens (never exposed to clients)
+const SESSION_SECRET_KEY = new Uint8Array(
+  process.env.STUDENT_SESSION_SECRET
+    ? crypto.createHash('sha256').update(process.env.STUDENT_SESSION_SECRET).digest()
+    : process.env.GEMINI_API_KEY
+    ? crypto
+        .createHash('sha256')
+        .update(`b1-speaking-session:${process.env.GEMINI_API_KEY}:${firebaseProjectId}`)
+        .digest()
+    : crypto.randomBytes(32)
+);
+
+const revokedSessionJtis = new Map<string, number>();
+const sessionAttemptWindows = new Map<string, { count: number; resetAt: number }>();
+
+function cleanupExpiredMaps() {
+  const now = Date.now();
+  for (const [jti, expMs] of revokedSessionJtis.entries()) {
+    if (expMs <= now) revokedSessionJtis.delete(jti);
+  }
+  for (const [ip, win] of sessionAttemptWindows.entries()) {
+    if (win.resetAt <= now) sessionAttemptWindows.delete(ip);
+  }
+}
+
+function checkSessionRateLimit(ip: string): boolean {
+  cleanupExpiredMaps();
+  const now = Date.now();
+  const entry = sessionAttemptWindows.get(ip);
+  if (!entry || entry.resetAt <= now) {
+    sessionAttemptWindows.set(ip, { count: 1, resetAt: now + 10 * 60 * 1000 });
+    return true;
+  }
+  if (entry.count >= 30) {
+    return false;
+  }
+  entry.count += 1;
+  return true;
 }
 
 const JWKS = createRemoteJWKSet(
@@ -38,15 +83,121 @@ const JWKS = createRemoteJWKSet(
   )
 );
 
+interface VerifiedStudentSessionInfo {
+  sessionUid: string;
+  canonicalStudentUid: string;
+  rosterId: string;
+  studentId: string;
+  fullName: string;
+  className: string;
+  expiresAtMs: number;
+}
+
 interface AuthenticatedRequest extends Request {
   authUser?: {
     uid: string;
     email: string;
     emailVerified: boolean;
+    isAnonymous: boolean;
+    idToken: string;
+  };
+  studentSession?: VerifiedStudentSessionInfo;
+}
+
+interface FirestoreRestDoc {
+  fields?: Record<
+    string,
+    {
+      stringValue?: string;
+      timestampValue?: string;
+      booleanValue?: boolean;
+      integerValue?: string;
+    }
+  >;
+}
+
+async function fetchFirestoreDocWithToken(
+  collectionPath: string,
+  docId: string,
+  idToken: string
+): Promise<FirestoreRestDoc | null> {
+  if (!firebaseProjectId) return null;
+  const safeDb = encodeURIComponent(firestoreDatabaseId || '(default)');
+  const safeCol = collectionPath
+    .split('/')
+    .map((s) => encodeURIComponent(s))
+    .join('/');
+  const url = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(
+    firebaseProjectId
+  )}/databases/${safeDb}/documents/${safeCol}/${encodeURIComponent(docId)}`;
+
+  const res = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${idToken}`,
+    },
+  });
+
+  if (!res.ok) {
+    return null;
+  }
+  return (await res.json()) as FirestoreRestDoc;
+}
+
+async function fetchActiveStudentSessionFromFirestore(
+  uid: string,
+  idToken: string
+): Promise<VerifiedStudentSessionInfo | null> {
+  const doc = await fetchFirestoreDocWithToken('studentSessions', uid, idToken);
+  if (!doc || !doc.fields) return null;
+
+  const status = doc.fields.status?.stringValue || '';
+  const expiresAtIso = doc.fields.expiresAt?.timestampValue || '';
+  const expiresAtMs = expiresAtIso ? Date.parse(expiresAtIso) : 0;
+
+  if (status !== 'active' || !Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()) {
+    return null;
+  }
+
+  const sessionUid = doc.fields.sessionUid?.stringValue || '';
+  const studentIdKey = doc.fields.studentIdKey?.stringValue || '';
+  const studentId = doc.fields.studentId?.stringValue || '';
+  const fullName = doc.fields.fullName?.stringValue || '';
+  const className = doc.fields.className?.stringValue || '';
+
+  if (sessionUid !== uid || !studentIdKey || !studentId || !fullName || !className) {
+    return null;
+  }
+
+  return {
+    sessionUid,
+    canonicalStudentUid: `stu_${studentIdKey}`,
+    rosterId: studentIdKey,
+    studentId,
+    fullName,
+    className,
+    expiresAtMs,
   };
 }
 
-async function verifyFirebaseAuth(
+async function isVerifiedTeacherAccount(
+  uid: string,
+  email: string,
+  emailVerified: boolean,
+  idToken: string
+): Promise<boolean> {
+  if (!emailVerified) return false;
+  if (email.toLowerCase() === BOOTSTRAPPED_TEACHER_EMAIL.toLowerCase()) {
+    return true;
+  }
+  const userDoc = await fetchFirestoreDocWithToken('users', uid, idToken);
+  if (!userDoc?.fields) return false;
+  return (
+    userDoc.fields.role?.stringValue === 'teacher' &&
+    userDoc.fields.accountStatus?.stringValue === 'active'
+  );
+}
+
+async function verifyFirebaseTokenOnly(
   req: AuthenticatedRequest,
   res: Response,
   next: NextFunction
@@ -72,18 +223,103 @@ async function verifyFirebaseAuth(
     const uid = typeof payload.sub === 'string' ? payload.sub : '';
     const email = typeof payload.email === 'string' ? payload.email : '';
     const emailVerified = payload.email_verified === true;
+    const firebaseClaim = payload.firebase as { sign_in_provider?: string } | undefined;
+    const isAnonymous = firebaseClaim?.sign_in_provider === 'anonymous';
 
-    if (!uid || !emailVerified) {
-      res.status(403).json({ error: 'A verified Google account is required.' });
+    if (!uid) {
+      res.status(401).json({ error: 'Invalid Firebase authentication token.' });
       return;
     }
 
-    req.authUser = { uid, email, emailVerified };
+    req.authUser = {
+      uid,
+      email,
+      emailVerified,
+      isAnonymous,
+      idToken: token,
+    };
     next();
   } catch (err) {
     console.error('Token verification failed:', err);
-    res.status(401).json({ error: 'Authentication token is invalid or expired. Please sign in again.' });
+    res.status(401).json({
+      error: 'Authentication token is invalid or expired. Please start a new session.',
+    });
   }
+}
+
+async function verifyAssessAuth(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  await verifyFirebaseTokenOnly(req, res, async () => {
+    const authUser = req.authUser;
+    if (!authUser) return;
+
+    // Path 1: Verified Teacher (Google Auth)
+    if (!authUser.isAnonymous && authUser.emailVerified) {
+      const teacherOk = await isVerifiedTeacherAccount(
+        authUser.uid,
+        authUser.email,
+        authUser.emailVerified,
+        authUser.idToken
+      );
+      if (teacherOk) {
+        next();
+        return;
+      }
+    }
+
+    // Path 2: Verified Student (Firebase Anonymous Auth + Server-Signed Student Session Token + Active Firestore Session)
+    const sessionHeader = req.headers['x-student-session'];
+    const sessionToken = typeof sessionHeader === 'string' ? sessionHeader.trim() : '';
+    if (!sessionToken) {
+      res.status(401).json({
+        error: 'Your student speaking session token is missing. Please re-enter your Student ID and Class.',
+      });
+      return;
+    }
+
+    try {
+      const { payload } = await jwtVerify(sessionToken, SESSION_SECRET_KEY, {
+        algorithms: ['HS256'],
+        issuer: 'b1-speaking-practice',
+        audience: 'student-session',
+      });
+
+      const jti = typeof payload.jti === 'string' ? payload.jti : '';
+      if (!jti || revokedSessionJtis.has(jti)) {
+        res.status(401).json({
+          error: 'Your student session has ended. Please enter your details again to continue.',
+        });
+        return;
+      }
+
+      if (payload.sub !== authUser.uid || payload.role !== 'student') {
+        res.status(403).json({ error: 'Student session mismatch. Access denied.' });
+        return;
+      }
+
+      const activeFirestoreSession = await fetchActiveStudentSessionFromFirestore(
+        authUser.uid,
+        authUser.idToken
+      );
+      if (!activeFirestoreSession) {
+        res.status(401).json({
+          error: 'Your temporary student session is expired or inactive. Please start a new session.',
+        });
+        return;
+      }
+
+      req.studentSession = activeFirestoreSession;
+      next();
+    } catch (err) {
+      console.error('Student session token verification failed:', err);
+      res.status(401).json({
+        error: 'Your student session token expired or is invalid. Please re-verify your Student ID.',
+      });
+    }
+  });
 }
 
 const upload = multer({
@@ -394,18 +630,123 @@ Please listen carefully to the attached audio recording, transcribe it verbatim,
 
 async function startServer() {
   const app = express();
+  app.use(express.json({ limit: '64kb' }));
 
   app.get('/api/health', (_req, res) => {
     res.json({
       status: 'ok',
       geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
       firebaseProjectConfigured: Boolean(firebaseProjectId),
+      studentSessionAuthEnabled: true,
     });
+  });
+
+  // Issues a short-lived signed student session token ONLY after verifying both the Firebase Anonymous Auth token
+  // AND the Firestore rule-validated studentSessions/{uid} document (never trusting client-supplied student name/ID).
+  app.post(
+    '/api/student/session',
+    verifyFirebaseTokenOnly,
+    async (req: AuthenticatedRequest, res: Response) => {
+      const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+      if (!checkSessionRateLimit(clientIp)) {
+        res.status(429).json({
+          error: 'Too many verification attempts. Please wait a few minutes and try again.',
+        });
+        return;
+      }
+
+      const authUser = req.authUser;
+      if (!authUser) return;
+
+      if (!authUser.isAnonymous) {
+        res.status(403).json({
+          error: 'Student session endpoint is restricted to verified student access.',
+        });
+        return;
+      }
+
+      try {
+        const session = await fetchActiveStudentSessionFromFirestore(
+          authUser.uid,
+          authUser.idToken
+        );
+        if (!session) {
+          res.status(403).json({
+            error:
+              'Student identity could not be verified. Please check your Full Name, Student ID, and Class.',
+          });
+          return;
+        }
+
+        const nowSeconds = Math.floor(Date.now() / 1000);
+        const firestoreExpSeconds = Math.floor(session.expiresAtMs / 1000);
+        const tokenExpSeconds = Math.min(
+          firestoreExpSeconds,
+          nowSeconds + STUDENT_TOKEN_TTL_SECONDS
+        );
+        const jti = crypto.randomUUID();
+
+        const sessionToken = await new SignJWT({
+          role: 'student',
+          canonicalStudentUid: session.canonicalStudentUid,
+          rosterId: session.rosterId,
+          studentId: session.studentId,
+          fullName: session.fullName,
+          className: session.className,
+        })
+          .setProtectedHeader({ alg: 'HS256' })
+          .setIssuedAt(nowSeconds)
+          .setExpirationTime(tokenExpSeconds)
+          .setIssuer('b1-speaking-practice')
+          .setAudience('student-session')
+          .setSubject(authUser.uid)
+          .setJti(jti)
+          .sign(SESSION_SECRET_KEY);
+
+        res.json({
+          sessionToken,
+          expiresAt: tokenExpSeconds * 1000,
+          student: {
+            canonicalStudentUid: session.canonicalStudentUid,
+            studentId: session.studentId,
+            fullName: session.fullName,
+            className: session.className,
+          },
+        });
+      } catch (err) {
+        console.error('Failed to issue student session token:', err);
+        res.status(500).json({ error: 'Unable to verify student session right now.' });
+      }
+    }
+  );
+
+  app.post('/api/student/logout', async (req: Request, res: Response) => {
+    const sessionHeader = req.headers['x-student-session'];
+    const sessionToken = typeof sessionHeader === 'string' ? sessionHeader.trim() : '';
+    if (sessionToken) {
+      try {
+        const { payload } = await jwtVerify(sessionToken, SESSION_SECRET_KEY, {
+          algorithms: ['HS256'],
+          issuer: 'b1-speaking-practice',
+          audience: 'student-session',
+        });
+        if (typeof payload.jti === 'string') {
+          const expMs =
+            typeof payload.exp === 'number'
+              ? payload.exp * 1000
+              : Date.now() + STUDENT_TOKEN_TTL_SECONDS * 1000;
+          revokedSessionJtis.set(payload.jti, expMs);
+        }
+      } catch {
+        // Token already expired or invalid; safe to ignore on logout
+      }
+    }
+    res.json({ ok: true });
   });
 
   app.post(
     '/api/assess',
-    verifyFirebaseAuth,
+    verifyAssessAuth,
     upload.single('audio'),
     async (req: AuthenticatedRequest, res: Response) => {
       try {

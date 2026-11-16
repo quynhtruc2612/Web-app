@@ -2,7 +2,7 @@
   "entities": {
     "UserProfile": {
       "title": "UserProfile",
-      "description": "Authenticated teacher or student account profile.",
+      "description": "Authenticated teacher or legacy student account profile.",
       "type": "object",
       "properties": {
         "userId": {
@@ -62,7 +62,7 @@
     },
     "StudentRosterEntry": {
       "title": "StudentRosterEntry",
-      "description": "Teacher-managed student roster record used for class assignment, CSV import, and account status management.",
+      "description": "Teacher-managed student roster record with unique Student ID used for class assignment, CSV import, and verification.",
       "type": "object",
       "properties": {
         "rosterId": {
@@ -83,7 +83,7 @@
         },
         "email": {
           "type": "string",
-          "minLength": 3,
+          "minLength": 0,
           "maxLength": 200
         },
         "className": {
@@ -127,6 +127,177 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "StudentVerificationRecord": {
+      "title": "StudentVerificationRecord",
+      "description": "Teacher-managed verification index keyed by normalized Student ID, unreadable by students and evaluated only by Firestore rules during session creation.",
+      "type": "object",
+      "properties": {
+        "studentIdKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "rosterId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "studentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "fullName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "fullNameNormalized": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "className": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "classNameNormalized": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "accountStatus": {
+          "type": "string",
+          "enum": ["active", "inactive"]
+        },
+        "canonicalStudentUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "updatedBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "studentIdKey",
+        "rosterId",
+        "studentId",
+        "fullName",
+        "fullNameNormalized",
+        "className",
+        "classNameNormalized",
+        "accountStatus",
+        "canonicalStudentUid",
+        "updatedBy",
+        "updatedAt"
+      ]
+    },
+    "StudentSession": {
+      "title": "StudentSession",
+      "description": "Short-lived anonymous student session verified against the teacher-managed roster.",
+      "type": "object",
+      "properties": {
+        "sessionUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "studentIdKey": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "studentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "fullName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "fullNameNormalized": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "className": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "classNameNormalized": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "status": {
+          "type": "string",
+          "enum": ["active", "ended"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "expiresAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "sessionUid",
+        "studentIdKey",
+        "studentId",
+        "fullName",
+        "fullNameNormalized",
+        "className",
+        "classNameNormalized",
+        "status",
+        "createdAt",
+        "updatedAt",
+        "expiresAt"
+      ]
+    },
+    "PublicClassCatalog": {
+      "title": "PublicClassCatalog",
+      "description": "Non-PII teacher-managed list of active class names shown in the Student Entry Form.",
+      "type": "object",
+      "properties": {
+        "classNames": {
+          "type": "array"
+        },
+        "updatedBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["classNames", "updatedBy", "updatedAt"]
     },
     "Assignment": {
       "title": "Assignment",
@@ -223,6 +394,12 @@
           "maxLength": 128,
           "pattern": "^[a-zA-Z0-9_\\-]+$"
         },
+        "canonicalStudentUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
         "studentId": {
           "type": "string",
           "minLength": 0,
@@ -235,7 +412,7 @@
         },
         "studentEmail": {
           "type": "string",
-          "minLength": 3,
+          "minLength": 0,
           "maxLength": 200
         },
         "className": {
@@ -351,6 +528,7 @@
       "required": [
         "submissionId",
         "studentUid",
+        "canonicalStudentUid",
         "studentId",
         "studentName",
         "studentEmail",
@@ -474,11 +652,23 @@
   "firestore": {
     "/users/{userId}": {
       "schema": { "$ref": "#/entities/UserProfile" },
-      "description": "User profile records with strict role separation."
+      "description": "Teacher and legacy user profile records with strict role separation."
     },
     "/studentRoster/{rosterId}": {
       "schema": { "$ref": "#/entities/StudentRosterEntry" },
-      "description": "Teacher-managed roster of students and class assignments."
+      "description": "Teacher-only roster of enrolled students with unique Student IDs."
+    },
+    "/studentVerification/{studentIdKey}": {
+      "schema": { "$ref": "#/entities/StudentVerificationRecord" },
+      "description": "Teacher-only verification index evaluated strictly inside Firestore rules during student session creation."
+    },
+    "/studentSessions/{sessionUid}": {
+      "schema": { "$ref": "#/entities/StudentSession" },
+      "description": "Short-lived Firebase Anonymous Auth sessions validated against the teacher roster."
+    },
+    "/publicConfig/{configId}": {
+      "schema": { "$ref": "#/entities/PublicClassCatalog" },
+      "description": "Non-PII class list catalog for the Student Entry Form dropdown."
     },
     "/assignments/{assignmentId}": {
       "schema": { "$ref": "#/entities/Assignment" },
@@ -494,7 +684,7 @@
     },
     "/studentProgress/{studentUid}": {
       "schema": { "$ref": "#/entities/StudentProgress" },
-      "description": "Student speaking progress summary calculated from assessed submissions."
+      "description": "Student speaking progress summary keyed by canonical student UID."
     }
   }
 }

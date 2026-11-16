@@ -29,6 +29,8 @@ import {
   deleteAssignment,
   deleteRosterStudent,
   setAssignmentStatus,
+  setRosterStudentStatus,
+  syncRosterVerificationAndClasses,
   updateAssignment,
   updateRosterStudent,
 } from '../../lib/db';
@@ -38,6 +40,7 @@ import {
   buildWeeklyStudentSummaries,
   formatDateShort,
   formatDateTime,
+  submissionBelongsToStudent,
 } from '../../lib/stats';
 import type {
   AccountStatus,
@@ -73,6 +76,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
 
   const [assignments, setAssignments] = useState<Assignment[]>([]);
   const [roster, setRoster] = useState<StudentRosterEntry[]>([]);
+  const [rosterLoaded, setRosterLoaded] = useState(false);
   const [users, setUsers] = useState<UserProfile[]>([]);
   const [submissions, setSubmissions] = useState<Submission[]>([]);
   const [loadingData, setLoadingData] = useState(true);
@@ -166,6 +170,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
         collection(db, 'studentRoster'),
         (snap) => {
           setRoster(snap.docs.map((d) => d.data() as StudentRosterEntry));
+          setRosterLoaded(true);
         },
         (err) => handleFirestoreError(err, OperationType.LIST, 'studentRoster')
       )
@@ -193,6 +198,11 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
 
     return () => unsubs.forEach((u) => u());
   }, []);
+
+  useEffect(() => {
+    if (!rosterLoaded) return;
+    syncRosterVerificationAndClasses(roster, profile.userId);
+  }, [roster, rosterLoaded, profile.userId]);
 
   const openAssignment = useMemo(
     () => assignments.find((a) => a.status === 'open') || null,
@@ -464,13 +474,17 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
 
   const handleSaveStudent = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!stuForm.studentId.trim() || !stuForm.fullName.trim() || !stuForm.email.trim()) {
-      showToast('Please fill in Student ID, Full Name, and Email.', 'error');
+    if (
+      !stuForm.studentId.trim() ||
+      !stuForm.fullName.trim() ||
+      !stuForm.className.trim()
+    ) {
+      showToast('Please fill in Student ID, Full Name, and Class.', 'error');
       return;
     }
     try {
       if (editingRoster) {
-        await updateRosterStudent(editingRoster, stuForm);
+        await updateRosterStudent(editingRoster, stuForm, profile.userId);
         showToast('Student information updated.');
       } else {
         await addRosterStudent({
@@ -507,6 +521,8 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
         className: string;
       }> = [];
 
+      let hasEmailColumnHint: boolean | null = null;
+
       lines.forEach((line, idx) => {
         const cols = line
           .split(',')
@@ -514,23 +530,34 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
         if (
           idx === 0 &&
           (cols[0]?.toLowerCase().includes('student') ||
-            cols[2]?.toLowerCase().includes('email'))
+            cols[0]?.toLowerCase() === 'id' ||
+            cols[1]?.toLowerCase().includes('name'))
         ) {
+          hasEmailColumnHint = cols.some((c) => c.toLowerCase().includes('email'));
           return; // skip header row
         }
-        if (cols.length >= 3 && cols[2].includes('@')) {
+        if (cols.length < 2 || !cols[0] || !cols[1]) return;
+
+        if (cols.length >= 4 || hasEmailColumnHint === true || (cols[2] && cols[2].includes('@'))) {
           parsed.push({
-            studentId: cols[0] || `ST-${idx}`,
-            fullName: cols[1] || 'Student',
-            email: cols[2].toLowerCase(),
+            studentId: cols[0],
+            fullName: cols[1],
+            email: (cols[2] || '').toLowerCase(),
             className: cols[3] || 'B1-A',
+          });
+        } else {
+          parsed.push({
+            studentId: cols[0],
+            fullName: cols[1],
+            email: '',
+            className: cols[2] || 'B1-A',
           });
         }
       });
 
       if (parsed.length === 0) {
         setCsvError(
-          'No valid student rows found. Expected columns: studentId,fullName,email,className'
+          'No valid student rows found. Expected columns: studentId,fullName,className (or studentId,fullName,email,className)'
         );
         return;
       }
@@ -543,11 +570,22 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
   const handleConfirmCsvImport = async () => {
     if (csvPreviewRows.length === 0) return;
     try {
-      const count = await bulkImportRosterStudents(
+      const { imported, skippedDuplicates } = await bulkImportRosterStudents(
         csvPreviewRows,
-        profile.userId
+        profile.userId,
+        roster
       );
-      showToast(`Imported ${count} students into the roster.`);
+      if (imported === 0 && skippedDuplicates.length > 0) {
+        setCsvError(
+          `All rows were skipped because these Student IDs already exist: ${skippedDuplicates.join(', ')}`
+        );
+        return;
+      }
+      const dupNote =
+        skippedDuplicates.length > 0
+          ? ` (${skippedDuplicates.length} duplicate ID${skippedDuplicates.length === 1 ? '' : 's'} skipped)`
+          : '';
+      showToast(`Imported ${imported} student${imported === 1 ? '' : 's'} into the roster${dupNote}.`);
       setCsvPreviewRows([]);
       setCsvModalOpen(false);
     } catch (err: any) {
@@ -557,7 +595,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
 
   const downloadCsvTemplate = () => {
     const template =
-      'studentId,fullName,email,className\nB1-001,Nguyen Minh Anh,minhanh@example.com,B1-Morning\nB1-002,Tran Hoang Nam,hoangnam@example.com,B1-Morning';
+      'studentId,fullName,email,className\nB1-001,Nguyen Minh Anh,,B1-Morning\nB1-002,Tran Hoang Nam,hoangnam@example.com,B1-Morning';
     const blob = new Blob([template], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -624,13 +662,14 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
       (s) =>
         s.key === reviewingStudentKey ||
         s.uid === reviewingStudentKey ||
-        s.email === reviewingStudentKey
+        (s.email && s.email === reviewingStudentKey) ||
+        (s.studentId &&
+          s.studentId !== '—' &&
+          s.studentId.toLowerCase() === reviewingStudentKey.toLowerCase())
     );
     if (!stu) return null;
-    const allStuSubs = submissions.filter(
-      (s) =>
-        (stu.uid && s.studentUid === stu.uid) ||
-        s.studentEmail.toLowerCase() === stu.email.toLowerCase()
+    const allStuSubs = submissions.filter((s) =>
+      submissionBelongsToStudent(s, stu)
     );
     return {
       student: stu,
@@ -994,8 +1033,15 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
                                     <button
                                       type="button"
                                       onClick={() => {
+                                        const matched = directory.find((stu) =>
+                                          submissionBelongsToStudent(sub, stu)
+                                        );
                                         setSelectedWeekId(sub.assignmentId);
-                                        setReviewingStudentKey(sub.studentUid);
+                                        setReviewingStudentKey(
+                                          matched?.key ||
+                                            sub.canonicalStudentUid ||
+                                            sub.studentUid
+                                        );
                                         setActiveTab('submissions');
                                       }}
                                       className="text-xs font-semibold text-blue-700 hover:underline"
@@ -1240,7 +1286,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
                             <th className="py-2.5 pr-4">Email</th>
                             <th className="py-2.5 pr-4">Class</th>
                             <th className="py-2.5 pr-4">Account Status</th>
-                            <th className="py-2.5 pr-4">Google Link</th>
+                            <th className="py-2.5 pr-4">Entry Method</th>
                             <th className="py-2.5 text-right">Actions</th>
                           </tr>
                         </thead>
@@ -1263,8 +1309,8 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
                                 <td className="py-3 pr-4 font-medium text-slate-900">
                                   {stu.fullName}
                                 </td>
-                                <td className="py-3 pr-4 text-slate-600">
-                                  {stu.email}
+                                <td className="py-3 pr-4 text-slate-500">
+                                  {stu.email || '—'}
                                 </td>
                                 <td className="py-3 pr-4 text-slate-700">
                                   {stu.className}
@@ -1277,7 +1323,9 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
                                   )}
                                 </td>
                                 <td className="py-3 pr-4 text-xs text-slate-500">
-                                  {stu.linkedUid ? 'Signed in' : 'Pending first login'}
+                                  {stu.accountStatus === 'active'
+                                    ? 'Student ID & Class'
+                                    : 'Disabled'}
                                 </td>
                                 <td className="py-3 text-right">
                                   <div className="inline-flex items-center gap-3">
@@ -1286,7 +1334,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
                                         type="button"
                                         onClick={() => {
                                           setReviewingStudentKey(
-                                            stu.linkedUid || stu.email
+                                            stu.linkedUid || stu.rosterId
                                           );
                                           setActiveTab('submissions');
                                         }}
@@ -1295,6 +1343,40 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
                                         History
                                       </button>
                                     )}
+                                    <button
+                                      type="button"
+                                      onClick={async () => {
+                                        const nextStatus =
+                                          stu.accountStatus === 'active'
+                                            ? 'inactive'
+                                            : 'active';
+                                        try {
+                                          await setRosterStudentStatus(
+                                            stu,
+                                            nextStatus,
+                                            profile.userId
+                                          );
+                                          showToast(
+                                            `${stu.fullName} is now ${nextStatus}.`
+                                          );
+                                        } catch (err: any) {
+                                          showToast(
+                                            err?.message ||
+                                              'Unable to update student status.',
+                                            'error'
+                                          );
+                                        }
+                                      }}
+                                      className={`text-xs font-semibold hover:underline ${
+                                        stu.accountStatus === 'active'
+                                          ? 'text-amber-700'
+                                          : 'text-emerald-700'
+                                      }`}
+                                    >
+                                      {stu.accountStatus === 'active'
+                                        ? 'Deactivate'
+                                        : 'Activate'}
+                                    </button>
                                     <button
                                       type="button"
                                       onClick={() => openEditStudentModal(stu)}
@@ -1312,7 +1394,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
                                           confirmLabel: 'Remove',
                                           tone: 'danger',
                                           action: async () => {
-                                            await deleteRosterStudent(stu.rosterId);
+                                            await deleteRosterStudent(stu);
                                             showToast('Student removed from roster.');
                                           },
                                         })
@@ -1478,7 +1560,7 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
                                 ) : (
                                   weeklySummaries.map((row) => (
                                     <tr
-                                      key={row.studentEmail}
+                                      key={row.studentKey}
                                       className="hover:bg-slate-50/80"
                                     >
                                       <td className="py-3 pr-4 font-mono text-xs text-slate-700 tabular-nums">
@@ -1709,16 +1791,15 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
               </div>
               <div>
                 <label className="block text-xs font-semibold text-slate-700">
-                  Google Email
+                  Email <span className="font-normal text-slate-400">(Optional)</span>
                 </label>
                 <input
                   type="email"
-                  required
                   value={stuForm.email}
                   onChange={(e) =>
                     setStuForm((p) => ({ ...p, email: e.target.value }))
                   }
-                  placeholder="student@gmail.com"
+                  placeholder="Optional contact email"
                   className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
                 />
               </div>
@@ -1730,12 +1811,19 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
                   <input
                     type="text"
                     required
+                    list="teacher-class-suggestions"
                     value={stuForm.className}
                     onChange={(e) =>
                       setStuForm((p) => ({ ...p, className: e.target.value }))
                     }
+                    placeholder="e.g., B1-Morning"
                     className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
                   />
+                  <datalist id="teacher-class-suggestions">
+                    {classOptions.map((cls) => (
+                      <option key={cls} value={cls} />
+                    ))}
+                  </datalist>
                 </div>
                 <div>
                   <label className="block text-xs font-semibold text-slate-700">
@@ -1802,6 +1890,10 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
               <p className="text-slate-600">
                 Upload a CSV file with columns:{' '}
                 <code className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs">
+                  studentId,fullName,className
+                </code>{' '}
+                or{' '}
+                <code className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs">
                   studentId,fullName,email,className
                 </code>
               </p>
@@ -1841,7 +1933,8 @@ export const TeacherDashboard: React.FC<TeacherDashboardProps> = ({
                   <ul className="space-y-1 text-xs text-slate-600">
                     {csvPreviewRows.map((r, idx) => (
                       <li key={idx}>
-                        {r.studentId} · {r.fullName} · {r.email} · {r.className}
+                        {r.studentId} · {r.fullName} · {r.className}
+                        {r.email ? ` · ${r.email}` : ''}
                       </li>
                     ))}
                   </ul>

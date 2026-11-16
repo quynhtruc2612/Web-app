@@ -9,12 +9,14 @@ export type ProcessingStatus =
 
 export interface UserProfile {
   userId: string;
+  authUid?: string;
   fullName: string;
   email: string;
   role: UserRole;
   studentId: string;
   className: string;
   accountStatus: AccountStatus;
+  sessionExpiresAt?: number;
   createdAt: any;
   updatedAt: any;
 }
@@ -22,6 +24,7 @@ export interface UserProfile {
 export interface StudentRosterEntry {
   rosterId: string;
   studentId: string;
+  studentIdKey?: string;
   fullName: string;
   email: string;
   className: string;
@@ -29,6 +32,40 @@ export interface StudentRosterEntry {
   linkedUid: string;
   createdBy: string;
   createdAt: any;
+  updatedAt: any;
+}
+
+export interface StudentVerificationRecord {
+  studentIdKey: string;
+  rosterId: string;
+  studentId: string;
+  fullName: string;
+  fullNameNormalized: string;
+  className: string;
+  classNameNormalized: string;
+  accountStatus: AccountStatus;
+  canonicalStudentUid: string;
+  updatedBy: string;
+  updatedAt: any;
+}
+
+export interface StudentSession {
+  sessionUid: string;
+  studentIdKey: string;
+  studentId: string;
+  fullName: string;
+  fullNameNormalized: string;
+  className: string;
+  classNameNormalized: string;
+  status: 'active' | 'ended';
+  createdAt: any;
+  updatedAt: any;
+  expiresAt: any;
+}
+
+export interface PublicClassCatalog {
+  classNames: string[];
+  updatedBy: string;
   updatedAt: any;
 }
 
@@ -82,6 +119,7 @@ export interface ExpressionCorrection {
 export interface Submission {
   submissionId: string;
   studentUid: string;
+  canonicalStudentUid?: string;
   studentId: string;
   studentName: string;
   studentEmail: string;
@@ -141,4 +179,3 @@ export interface StudentProgress {
   createdAt: any;
   updatedAt: any;
 }
-

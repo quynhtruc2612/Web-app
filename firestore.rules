@@ -20,25 +20,45 @@ service cloud.firestore {
       return resource.data;
     }
 
-    function isSignedIn() {
+    function isSignedInAny() {
+      return request.auth != null;
+    }
+
+    function isVerifiedGoogleUser() {
       return request.auth != null && request.auth.token.email_verified == true;
     }
 
+    function isAnonymousStudent() {
+      return request.auth != null &&
+        request.auth.token.firebase.sign_in_provider == 'anonymous';
+    }
+
     function isBootstrappedTeacher() {
-      return isSignedIn() && request.auth.token.email == 'quynhtruc2612@gmail.com';
+      return isVerifiedGoogleUser() && request.auth.token.email == 'quynhtruc2612@gmail.com';
     }
 
     function isTeacher() {
       return isBootstrappedTeacher() || (
-        isSignedIn() &&
+        isVerifiedGoogleUser() &&
         exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'teacher' &&
         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.accountStatus == 'active'
       );
     }
 
-    function isOwner(uid) {
-      return isSignedIn() && request.auth.uid == uid;
+    function isOwnerAny(uid) {
+      return isSignedInAny() && request.auth.uid == uid;
+    }
+
+    function hasActiveStudentSession() {
+      return isSignedInAny() &&
+        exists(/databases/$(database)/documents/studentSessions/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/studentSessions/$(request.auth.uid)).data.status == 'active' &&
+        get(/databases/$(database)/documents/studentSessions/$(request.auth.uid)).data.expiresAt > request.time;
+    }
+
+    function studentSessionData() {
+      return get(/databases/$(database)/documents/studentSessions/$(request.auth.uid)).data;
     }
 
     // 3. Entity Validation Blueprints (Pure static checks, no existing() or diff())
@@ -68,18 +88,82 @@ service cloud.firestore {
           'accountStatus', 'linkedUid', 'createdBy', 'createdAt', 'updatedAt'
         ]) &&
         data.keys().hasOnly([
-          'rosterId', 'studentId', 'fullName', 'email', 'className',
+          'rosterId', 'studentId', 'studentIdKey', 'fullName', 'email', 'className',
           'accountStatus', 'linkedUid', 'createdBy', 'createdAt', 'updatedAt'
         ]) &&
         data.rosterId is string && data.rosterId == rosterId && isValidId(data.rosterId) &&
         data.studentId is string && data.studentId.size() >= 1 && data.studentId.size() <= 40 &&
+        (!('studentIdKey' in data) || (data.studentIdKey is string && isValidId(data.studentIdKey))) &&
         data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 120 &&
-        data.email is string && data.email.size() >= 3 && data.email.size() <= 200 &&
+        data.email is string && data.email.size() <= 200 &&
         data.className is string && data.className.size() >= 1 && data.className.size() <= 60 &&
         data.accountStatus in ['active', 'inactive'] &&
         data.linkedUid is string && data.linkedUid.size() <= 128 &&
         data.createdBy is string && isValidId(data.createdBy) &&
         data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidStudentVerification(data, studentIdKey) {
+      return data.keys().hasAll([
+          'studentIdKey', 'rosterId', 'studentId', 'fullName', 'fullNameNormalized',
+          'className', 'classNameNormalized', 'accountStatus', 'canonicalStudentUid',
+          'updatedBy', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'studentIdKey', 'rosterId', 'studentId', 'fullName', 'fullNameNormalized',
+          'className', 'classNameNormalized', 'accountStatus', 'canonicalStudentUid',
+          'updatedBy', 'updatedAt'
+        ]) &&
+        data.studentIdKey is string && data.studentIdKey == studentIdKey && isValidId(data.studentIdKey) &&
+        data.rosterId is string && isValidId(data.rosterId) &&
+        data.studentId is string && data.studentId.size() >= 1 && data.studentId.size() <= 40 &&
+        data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 120 &&
+        data.fullNameNormalized is string && data.fullNameNormalized.size() >= 1 && data.fullNameNormalized.size() <= 120 &&
+        data.className is string && data.className.size() >= 1 && data.className.size() <= 60 &&
+        data.classNameNormalized is string && data.classNameNormalized.size() >= 1 && data.classNameNormalized.size() <= 60 &&
+        data.accountStatus in ['active', 'inactive'] &&
+        data.canonicalStudentUid is string && isValidId(data.canonicalStudentUid) &&
+        data.updatedBy is string && isValidId(data.updatedBy) &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidStudentSession(data, sessionUid) {
+      return data.keys().hasAll([
+          'sessionUid', 'studentIdKey', 'studentId',
+          'fullName', 'fullNameNormalized', 'className', 'classNameNormalized',
+          'status', 'createdAt', 'updatedAt', 'expiresAt'
+        ]) &&
+        data.keys().hasOnly([
+          'sessionUid', 'studentIdKey', 'studentId',
+          'fullName', 'fullNameNormalized', 'className', 'classNameNormalized',
+          'status', 'createdAt', 'updatedAt', 'expiresAt'
+        ]) &&
+        data.sessionUid is string && data.sessionUid == sessionUid && isValidId(data.sessionUid) &&
+        data.studentIdKey is string && isValidId(data.studentIdKey) &&
+        data.studentId is string && data.studentId.size() >= 1 && data.studentId.size() <= 40 &&
+        data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 120 &&
+        data.fullNameNormalized is string && data.fullNameNormalized.size() >= 1 && data.fullNameNormalized.size() <= 120 &&
+        data.fullName.trim().lower() == data.fullNameNormalized &&
+        data.className is string && data.className.size() >= 1 && data.className.size() <= 60 &&
+        data.classNameNormalized is string && data.classNameNormalized.size() >= 1 && data.classNameNormalized.size() <= 60 &&
+        data.className.trim().lower() == data.classNameNormalized &&
+        data.status in ['active', 'ended'] &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp &&
+        data.expiresAt is timestamp;
+    }
+
+    function canonicalStudentUidFromSession() {
+      return 'stu_' + studentSessionData().studentIdKey;
+    }
+
+    function isValidPublicClassCatalog(data) {
+      return data.keys().hasAll(['classNames', 'updatedBy', 'updatedAt']) &&
+        data.keys().hasOnly(['classNames', 'updatedBy', 'updatedAt']) &&
+        data.classNames is list && data.classNames.size() <= 100 &&
+        (data.classNames.size() == 0 || (data.classNames[0] is string && data.classNames[0].size() >= 1 && data.classNames[0].size() <= 60)) &&
+        data.updatedBy is string && isValidId(data.updatedBy) &&
         data.updatedAt is timestamp;
     }
 
@@ -145,7 +229,7 @@ service cloud.firestore {
           'assessedAt', 'updatedAt'
         ]) &&
         data.keys().hasOnly([
-          'submissionId', 'studentUid', 'studentId', 'studentName', 'studentEmail',
+          'submissionId', 'studentUid', 'canonicalStudentUid', 'studentId', 'studentName', 'studentEmail',
           'className', 'assignmentId', 'weekNumber', 'assignmentTitle', 'questionId',
           'questionPromptSnapshot', 'audioStorageType', 'audioStoragePath',
           'audioMimeType', 'audioChunkCount', 'recordingDuration', 'processingStatus',
@@ -156,9 +240,10 @@ service cloud.firestore {
         ]) &&
         data.submissionId is string && data.submissionId == submissionId && isValidId(data.submissionId) &&
         data.studentUid is string && isValidId(data.studentUid) &&
+        (!('canonicalStudentUid' in data) || (data.canonicalStudentUid is string && isValidId(data.canonicalStudentUid))) &&
         data.studentId is string && data.studentId.size() <= 40 &&
         data.studentName is string && data.studentName.size() >= 1 && data.studentName.size() <= 120 &&
-        data.studentEmail is string && data.studentEmail.size() >= 3 && data.studentEmail.size() <= 200 &&
+        data.studentEmail is string && data.studentEmail.size() <= 200 &&
         data.className is string && data.className.size() <= 60 &&
         data.assignmentId is string && isValidId(data.assignmentId) &&
         data.weekNumber is int && data.weekNumber >= 1 && data.weekNumber <= 100 &&
@@ -229,55 +314,60 @@ service cloud.firestore {
 
     // 4. Connection check document
     match /test/connection {
-      allow get: if isSignedIn();
+      allow get: if isSignedInAny();
     }
 
-    // 5. Users Collection
-    match /users/{userId} {
-      allow get: if isValidId(userId) && (isOwner(userId) || isTeacher());
+    // 5. Public Non-PII Class List for Student Entry Form
+    match /publicConfig/{configId} {
+      allow get: if configId == 'classes' || isTeacher();
       allow list: if isBootstrappedTeacher();
 
-      allow create: if isSignedIn() &&
+      allow create: if isTeacher() &&
+        configId == 'classes' &&
+        isValidPublicClassCatalog(incoming()) &&
+        incoming().updatedBy == request.auth.uid &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isTeacher() &&
+        configId == 'classes' &&
+        isValidPublicClassCatalog(incoming()) &&
+        incoming().updatedBy == request.auth.uid &&
+        incoming().updatedAt == request.time;
+
+      allow delete: if isTeacher() && isValidId(configId);
+    }
+
+    // 6. Users Collection (Google-authenticated Teachers & Legacy Profiles)
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isVerifiedGoogleUser() && (request.auth.uid == userId || isTeacher());
+      allow list: if isBootstrappedTeacher();
+
+      allow create: if isVerifiedGoogleUser() &&
         isValidId(userId) &&
         isValidUser(incoming(), userId) &&
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time &&
         (
-          (isBootstrappedTeacher() && isOwner(userId)) ||
-          (isTeacher() && incoming().role == 'student') ||
-          (isOwner(userId) && incoming().role == 'student' && incoming().accountStatus == 'active')
+          (isBootstrappedTeacher() && request.auth.uid == userId) ||
+          (isTeacher() && incoming().role == 'student')
         );
 
-      allow update: if isSignedIn() &&
+      allow update: if isVerifiedGoogleUser() &&
         isValidId(userId) &&
         isValidUser(incoming(), userId) &&
         incoming().createdAt == existing().createdAt &&
         incoming().updatedAt == request.time &&
         incoming().userId == existing().userId &&
         incoming().email == existing().email &&
-        (
-          isTeacher() ||
-          (
-            isOwner(userId) &&
-            incoming().role == existing().role &&
-            incoming().accountStatus == existing().accountStatus &&
-            incoming().diff(existing()).affectedKeys().hasOnly(['fullName', 'studentId', 'className', 'updatedAt'])
-          )
-        );
+        isTeacher();
 
       allow delete: if isValidId(userId) && isTeacher();
     }
 
-    // 6. Student Roster Collection
+    // 7. Student Roster Collection (Strictly Teacher-Only)
     match /studentRoster/{rosterId} {
-      allow get: if isValidId(rosterId) && (
-        isTeacher() ||
-        (isSignedIn() && existing().email == request.auth.token.email)
-      );
-      allow list: if isSignedIn() && (
-        isBootstrappedTeacher() ||
-        resource.data.email == request.auth.token.email
-      );
+      allow get: if isValidId(rosterId) && isTeacher();
+      allow list: if isBootstrappedTeacher();
 
       allow create: if isTeacher() &&
         isValidId(rosterId) &&
@@ -286,32 +376,85 @@ service cloud.firestore {
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time;
 
-      allow update: if isSignedIn() &&
+      allow update: if isTeacher() &&
         isValidId(rosterId) &&
         isValidRoster(incoming(), rosterId) &&
         incoming().createdBy == existing().createdBy &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time;
+
+      allow delete: if isValidId(rosterId) && isTeacher();
+    }
+
+    // 8. Student Verification Index (Strictly Teacher-Only; evaluated by rules via get())
+    match /studentVerification/{studentIdKey} {
+      allow get: if isValidId(studentIdKey) && isTeacher();
+      allow list: if isBootstrappedTeacher();
+
+      allow create: if isTeacher() &&
+        isValidId(studentIdKey) &&
+        isValidStudentVerification(incoming(), studentIdKey) &&
+        incoming().updatedBy == request.auth.uid &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isTeacher() &&
+        isValidId(studentIdKey) &&
+        isValidStudentVerification(incoming(), studentIdKey) &&
+        incoming().updatedBy == request.auth.uid &&
+        incoming().updatedAt == request.time;
+
+      allow delete: if isValidId(studentIdKey) && isTeacher();
+    }
+
+    // 9. Temporary Student Sessions (Bound to Firebase Anonymous Auth UID + Teacher Roster Check)
+    match /studentSessions/{sessionUid} {
+      allow get: if isSignedInAny() && isValidId(sessionUid) && (
+        isOwnerAny(sessionUid) || isTeacher()
+      );
+      allow list: if isBootstrappedTeacher();
+
+      allow create: if isAnonymousStudent() &&
+        isValidId(sessionUid) &&
+        sessionUid == request.auth.uid &&
+        isValidStudentSession(incoming(), sessionUid) &&
+        incoming().status == 'active' &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        incoming().expiresAt > request.time &&
+        incoming().expiresAt <= request.time + duration.value(12, 'h') &&
+        exists(/databases/$(database)/documents/studentVerification/$(incoming().studentIdKey)) &&
+        get(/databases/$(database)/documents/studentVerification/$(incoming().studentIdKey)).data.accountStatus == 'active' &&
+        get(/databases/$(database)/documents/studentVerification/$(incoming().studentIdKey)).data.fullNameNormalized == incoming().fullNameNormalized &&
+        get(/databases/$(database)/documents/studentVerification/$(incoming().studentIdKey)).data.classNameNormalized == incoming().classNameNormalized;
+
+      allow update: if isSignedInAny() &&
+        isValidId(sessionUid) &&
+        isValidStudentSession(incoming(), sessionUid) &&
+        incoming().sessionUid == existing().sessionUid &&
+        incoming().studentIdKey == existing().studentIdKey &&
         incoming().createdAt == existing().createdAt &&
         incoming().updatedAt == request.time &&
         (
           isTeacher() ||
           (
-            existing().email == request.auth.token.email &&
-            existing().linkedUid == '' &&
-            incoming().linkedUid == request.auth.uid &&
-            incoming().diff(existing()).affectedKeys().hasOnly(['linkedUid', 'updatedAt'])
+            isOwnerAny(sessionUid) &&
+            incoming().status == 'ended' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
           )
         );
 
-      allow delete: if isValidId(rosterId) && isTeacher();
+      allow delete: if isSignedInAny() && isValidId(sessionUid) && (
+        isOwnerAny(sessionUid) || isTeacher()
+      );
     }
 
-    // 7. Weekly Assignments Collection
+    // 10. Weekly Assignments Collection
     match /assignments/{assignmentId} {
-      allow get: if isSignedIn() && isValidId(assignmentId) && (
+      allow get: if isSignedInAny() && isValidId(assignmentId) && (
         isTeacher() ||
-        existing().status in ['open', 'locked']
+        (hasActiveStudentSession() && existing().status in ['open', 'locked'])
       );
-      allow list: if isSignedIn() && (
+      allow list: if isSignedInAny() && (
         isBootstrappedTeacher() ||
         resource.data.status in ['open', 'locked']
       );
@@ -333,21 +476,44 @@ service cloud.firestore {
       allow delete: if isValidId(assignmentId) && isTeacher();
     }
 
-    // 8. Submissions Collection
+    // 11. Submissions Collection
     match /submissions/{submissionId} {
-      allow get: if isSignedIn() && isValidId(submissionId) && (
+      allow get: if isSignedInAny() && isValidId(submissionId) && (
         isTeacher() ||
-        existing().studentUid == request.auth.uid
+        (
+          resource == null &&
+          hasActiveStudentSession() &&
+          submissionId.matches('^[a-zA-Z0-9_-]+__' + canonicalStudentUidFromSession() + '$')
+        ) ||
+        (
+          resource != null &&
+          (
+            existing().studentUid == request.auth.uid ||
+            (
+              hasActiveStudentSession() &&
+              (
+                ('canonicalStudentUid' in existing() && existing().canonicalStudentUid == canonicalStudentUidFromSession()) ||
+                existing().studentUid == canonicalStudentUidFromSession()
+              )
+            )
+          )
+        )
       );
-      allow list: if isSignedIn() && (
+      allow list: if isSignedInAny() && (
         isBootstrappedTeacher() ||
         resource.data.studentUid == request.auth.uid
       );
 
-      allow create: if isSignedIn() &&
+      allow create: if isSignedInAny() &&
         isValidId(submissionId) &&
         isValidSubmission(incoming(), submissionId) &&
+        'canonicalStudentUid' in incoming() &&
+        hasActiveStudentSession() &&
         incoming().studentUid == request.auth.uid &&
+        incoming().canonicalStudentUid == canonicalStudentUidFromSession() &&
+        incoming().studentId == studentSessionData().studentId &&
+        incoming().studentName == studentSessionData().fullName &&
+        incoming().className == studentSessionData().className &&
         incoming().resubmissionAllowed == false &&
         incoming().processingStatus == 'processing' &&
         incoming().assessment == null &&
@@ -357,25 +523,34 @@ service cloud.firestore {
         exists(/databases/$(database)/documents/assignments/$(incoming().assignmentId)) &&
         get(/databases/$(database)/documents/assignments/$(incoming().assignmentId)).data.status == 'open';
 
-      allow update: if isSignedIn() &&
+      allow update: if isSignedInAny() &&
         isValidId(submissionId) &&
         isValidSubmission(incoming(), submissionId) &&
         incoming().submissionId == existing().submissionId &&
-        incoming().studentUid == existing().studentUid &&
         incoming().assignmentId == existing().assignmentId &&
         incoming().questionId == existing().questionId &&
         (
           (
             isTeacher() &&
+            incoming().studentUid == existing().studentUid &&
             incoming().updatedAt == request.time &&
             incoming().diff(existing()).affectedKeys().hasOnly(['resubmissionAllowed', 'updatedAt'])
           ) ||
           (
-            existing().studentUid == request.auth.uid &&
+            hasActiveStudentSession() &&
             incoming().updatedAt == request.time &&
+            'canonicalStudentUid' in incoming() &&
+            incoming().canonicalStudentUid == canonicalStudentUidFromSession() &&
+            (
+              existing().studentUid == request.auth.uid ||
+              ('canonicalStudentUid' in existing() && existing().canonicalStudentUid == canonicalStudentUidFromSession()) ||
+              existing().studentUid == canonicalStudentUidFromSession()
+            ) &&
             (
               // Action 1: Completing AI assessment or recording failure while processing/failed
               (
+                existing().studentUid == request.auth.uid &&
+                incoming().studentUid == existing().studentUid &&
                 existing().processingStatus in ['processing', 'failed', 'needs_rerecording'] &&
                 incoming().processingStatus in ['processing', 'feedback_available', 'failed', 'needs_rerecording'] &&
                 incoming().resubmissionAllowed == existing().resubmissionAllowed &&
@@ -386,16 +561,18 @@ service cloud.firestore {
                   'assessedAt', 'updatedAt'
                 ])
               ) ||
-              // Action 2: Authorized resubmission or re-recording after failure/inaudible on an open assignment
+              // Action 2: Authorized resubmission or re-recording on an open assignment
               (
                 (existing().resubmissionAllowed == true || existing().processingStatus in ['failed', 'needs_rerecording']) &&
                 get(/databases/$(database)/documents/assignments/$(existing().assignmentId)).data.status == 'open' &&
+                incoming().studentUid == request.auth.uid &&
                 incoming().resubmissionAllowed == false &&
                 incoming().processingStatus == 'processing' &&
                 incoming().assessment == null &&
                 incoming().overallScore == null &&
                 incoming().submittedAt == request.time &&
                 incoming().diff(existing()).affectedKeys().hasOnly([
+                  'studentUid', 'canonicalStudentUid', 'studentId', 'studentName', 'className',
                   'questionPromptSnapshot', 'audioStorageType', 'audioStoragePath',
                   'audioMimeType', 'audioChunkCount', 'recordingDuration',
                   'processingStatus', 'transcript', 'assessment', 'overallScore',
@@ -412,16 +589,24 @@ service cloud.firestore {
 
       // Master Gate Subcollection for resilient audio chunks
       match /audioChunks/{chunkIndex} {
-        allow get: if isSignedIn() && isValidId(submissionId) && isValidId(chunkIndex) && (
+        allow get: if isSignedInAny() && isValidId(submissionId) && isValidId(chunkIndex) && (
           isTeacher() ||
-          get(/databases/$(database)/documents/submissions/$(submissionId)).data.studentUid == request.auth.uid
+          get(/databases/$(database)/documents/submissions/$(submissionId)).data.studentUid == request.auth.uid ||
+          (
+            hasActiveStudentSession() &&
+            (
+              ('canonicalStudentUid' in get(/databases/$(database)/documents/submissions/$(submissionId)).data &&
+                get(/databases/$(database)/documents/submissions/$(submissionId)).data.canonicalStudentUid == canonicalStudentUidFromSession()) ||
+              get(/databases/$(database)/documents/submissions/$(submissionId)).data.studentUid == canonicalStudentUidFromSession()
+            )
+          )
         );
-        allow list: if isSignedIn() && (
+        allow list: if isSignedInAny() && (
           isBootstrappedTeacher() ||
           resource.data.studentUid == request.auth.uid
         );
 
-        allow create: if isSignedIn() &&
+        allow create: if isSignedInAny() &&
           isValidId(submissionId) &&
           isValidId(chunkIndex) &&
           isValidAudioChunk(incoming()) &&
@@ -430,7 +615,7 @@ service cloud.firestore {
           exists(/databases/$(database)/documents/submissions/$(submissionId)) &&
           get(/databases/$(database)/documents/submissions/$(submissionId)).data.studentUid == request.auth.uid;
 
-        allow update: if isSignedIn() &&
+        allow update: if isSignedInAny() &&
           isValidId(submissionId) &&
           isValidId(chunkIndex) &&
           isValidAudioChunk(incoming()) &&
@@ -440,32 +625,42 @@ service cloud.firestore {
           exists(/databases/$(database)/documents/submissions/$(submissionId)) &&
           get(/databases/$(database)/documents/submissions/$(submissionId)).data.studentUid == request.auth.uid;
 
-        allow delete: if isSignedIn() && isValidId(submissionId) && isValidId(chunkIndex) && (
+        allow delete: if isSignedInAny() && isValidId(submissionId) && isValidId(chunkIndex) && (
           isTeacher() ||
           get(/databases/$(database)/documents/submissions/$(submissionId)).data.studentUid == request.auth.uid
         );
       }
     }
 
-    // 9. Student Progress Collection
+    // 12. Student Progress Collection (Keyed by canonicalStudentUid)
     match /studentProgress/{studentUid} {
-      allow get: if isValidId(studentUid) && (isOwner(studentUid) || isTeacher());
-      allow list: if isSignedIn() && (
+      allow get: if isValidId(studentUid) && isSignedInAny() && (
+        isTeacher() ||
+        isOwnerAny(studentUid) ||
+        (hasActiveStudentSession() && canonicalStudentUidFromSession() == studentUid)
+      );
+      allow list: if isSignedInAny() && (
         isBootstrappedTeacher() ||
         resource.data.studentUid == request.auth.uid
       );
 
-      allow create: if isSignedIn() &&
+      allow create: if isSignedInAny() &&
         isValidId(studentUid) &&
         isValidStudentProgress(incoming(), studentUid) &&
-        (isOwner(studentUid) || isTeacher()) &&
+        (
+          isTeacher() ||
+          (hasActiveStudentSession() && canonicalStudentUidFromSession() == studentUid)
+        ) &&
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time;
 
-      allow update: if isSignedIn() &&
+      allow update: if isSignedInAny() &&
         isValidId(studentUid) &&
         isValidStudentProgress(incoming(), studentUid) &&
-        (isOwner(studentUid) || isTeacher()) &&
+        (
+          isTeacher() ||
+          (hasActiveStudentSession() && canonicalStudentUidFromSession() == studentUid)
+        ) &&
         incoming().studentUid == existing().studentUid &&
         incoming().createdAt == existing().createdAt &&
         incoming().updatedAt == request.time;

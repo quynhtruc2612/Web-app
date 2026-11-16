@@ -155,7 +155,8 @@ export const TeacherReviewPanel: React.FC<TeacherReviewPanelProps> = ({
       <div className="grid gap-4 rounded-xl border border-slate-200 bg-white p-6 md:grid-cols-12 md:items-center">
         <div className="md:col-span-7">
           <p className="text-xs font-medium text-slate-500">
-            {studentId || 'No ID'} · {className || 'Unassigned'} · {studentEmail}
+            {studentId || 'No ID'} · {className || 'Unassigned'}
+            {studentEmail ? ` · ${studentEmail}` : ''}
           </p>
           <h2 className="mt-1 text-2xl font-bold text-slate-900">{studentName}</h2>
           <p className="mt-1 text-sm text-slate-600">

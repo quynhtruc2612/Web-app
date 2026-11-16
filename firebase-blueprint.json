@@ -1,0 +1,431 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated teacher or student account profile.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "fullName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "email": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 200
+        },
+        "role": {
+          "type": "string",
+          "enum": ["teacher", "student"]
+        },
+        "studentId": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 40
+        },
+        "className": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 60
+        },
+        "accountStatus": {
+          "type": "string",
+          "enum": ["active", "inactive"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "userId",
+        "fullName",
+        "email",
+        "role",
+        "studentId",
+        "className",
+        "accountStatus",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "StudentRosterEntry": {
+      "title": "StudentRosterEntry",
+      "description": "Teacher-managed student roster record used for class assignment, CSV import, and account status management.",
+      "type": "object",
+      "properties": {
+        "rosterId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "studentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "fullName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "email": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 200
+        },
+        "className": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "accountStatus": {
+          "type": "string",
+          "enum": ["active", "inactive"]
+        },
+        "linkedUid": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 128
+        },
+        "createdBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "rosterId",
+        "studentId",
+        "fullName",
+        "email",
+        "className",
+        "accountStatus",
+        "linkedUid",
+        "createdBy",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "Assignment": {
+      "title": "Assignment",
+      "description": "Weekly speaking practice assignment created by a teacher.",
+      "type": "object",
+      "properties": {
+        "assignmentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "weekNumber": {
+          "type": "integer"
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 150
+        },
+        "topic": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 150
+        },
+        "instructions": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 2500
+        },
+        "questions": {
+          "type": "array"
+        },
+        "questionCount": {
+          "type": "integer"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["draft", "open", "locked"]
+        },
+        "deadline": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 60
+        },
+        "createdBy": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "publishedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "assignmentId",
+        "weekNumber",
+        "title",
+        "topic",
+        "instructions",
+        "questions",
+        "questionCount",
+        "status",
+        "deadline",
+        "createdBy",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "Submission": {
+      "title": "Submission",
+      "description": "Individual question speaking submission, audio reference, transcript, and three-criterion AI assessment.",
+      "type": "object",
+      "properties": {
+        "submissionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "studentUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "studentId": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 40
+        },
+        "studentName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "studentEmail": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 200
+        },
+        "className": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 60
+        },
+        "assignmentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "weekNumber": {
+          "type": "integer"
+        },
+        "assignmentTitle": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 150
+        },
+        "questionId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "questionPromptSnapshot": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1500
+        },
+        "audioStorageType": {
+          "type": "string",
+          "enum": ["firebase_storage", "firestore_chunks", "none"]
+        },
+        "audioStoragePath": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 400
+        },
+        "audioMimeType": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "audioChunkCount": {
+          "type": "integer"
+        },
+        "recordingDuration": {
+          "type": "number"
+        },
+        "processingStatus": {
+          "type": "string",
+          "enum": ["processing", "feedback_available", "failed", "needs_rerecording"]
+        },
+        "transcript": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 15000
+        },
+        "assessment": {
+          "type": "object"
+        },
+        "overallScore": {
+          "type": "number"
+        },
+        "whatYouDidWell": {
+          "type": "array"
+        },
+        "areasToImprove": {
+          "type": "array"
+        },
+        "expressionCorrections": {
+          "type": "array"
+        },
+        "overallComment": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 3000
+        },
+        "aiModel": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 100
+        },
+        "promptVersion": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 40
+        },
+        "errorMessage": {
+          "type": "string",
+          "minLength": 0,
+          "maxLength": 1000
+        },
+        "resubmissionAllowed": {
+          "type": "boolean"
+        },
+        "submittedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "assessedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "submissionId",
+        "studentUid",
+        "studentId",
+        "studentName",
+        "studentEmail",
+        "className",
+        "assignmentId",
+        "weekNumber",
+        "assignmentTitle",
+        "questionId",
+        "questionPromptSnapshot",
+        "audioStorageType",
+        "audioStoragePath",
+        "audioMimeType",
+        "audioChunkCount",
+        "recordingDuration",
+        "processingStatus",
+        "transcript",
+        "whatYouDidWell",
+        "areasToImprove",
+        "expressionCorrections",
+        "overallComment",
+        "aiModel",
+        "promptVersion",
+        "errorMessage",
+        "resubmissionAllowed",
+        "submittedAt",
+        "updatedAt"
+      ]
+    },
+    "AudioChunk": {
+      "title": "AudioChunk",
+      "description": "Authenticated base64 audio segment stored when Firebase Cloud Storage bucket rules are unavailable.",
+      "type": "object",
+      "properties": {
+        "chunkIndex": {
+          "type": "integer"
+        },
+        "data": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 750000
+        },
+        "studentUid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["chunkIndex", "data", "studentUid", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "User profile records with strict role separation."
+    },
+    "/studentRoster/{rosterId}": {
+      "schema": { "$ref": "#/entities/StudentRosterEntry" },
+      "description": "Teacher-managed roster of students and class assignments."
+    },
+    "/assignments/{assignmentId}": {
+      "schema": { "$ref": "#/entities/Assignment" },
+      "description": "Weekly speaking practice assignments."
+    },
+    "/submissions/{submissionId}": {
+      "schema": { "$ref": "#/entities/Submission" },
+      "description": "Student speaking submissions and AI assessments per question."
+    },
+    "/submissions/{submissionId}/audioChunks/{chunkIndex}": {
+      "schema": { "$ref": "#/entities/AudioChunk" },
+      "description": "Secured audio recording chunks owned by the submitting student and readable by teachers."
+    }
+  }
+}

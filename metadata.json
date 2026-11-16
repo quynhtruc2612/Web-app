@@ -1,0 +1,6 @@
+{
+  "name": "B1 Speaking Practice",
+  "description": "An English speaking practice and AI-powered B1 Preliminary assessment platform for teachers and B1-level learners.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

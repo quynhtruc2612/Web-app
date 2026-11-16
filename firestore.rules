@@ -1,0 +1,419 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 1. Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 2. Global Hardened Primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isBootstrappedTeacher() {
+      return isSignedIn() && request.auth.token.email == 'quynhtruc2612@gmail.com';
+    }
+
+    function isTeacher() {
+      return isBootstrappedTeacher() || (
+        isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'teacher' &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.accountStatus == 'active'
+      );
+    }
+
+    function isOwner(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    // 3. Entity Validation Blueprints (Pure static checks, no existing() or diff())
+    function isValidUser(data, userId) {
+      return data.keys().hasAll([
+          'userId', 'fullName', 'email', 'role', 'studentId',
+          'className', 'accountStatus', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'userId', 'fullName', 'email', 'role', 'studentId',
+          'className', 'accountStatus', 'createdAt', 'updatedAt'
+        ]) &&
+        data.userId is string && data.userId == userId && isValidId(data.userId) &&
+        data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 120 &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 200 &&
+        data.role in ['teacher', 'student'] &&
+        data.studentId is string && data.studentId.size() <= 40 &&
+        data.className is string && data.className.size() <= 60 &&
+        data.accountStatus in ['active', 'inactive'] &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidRoster(data, rosterId) {
+      return data.keys().hasAll([
+          'rosterId', 'studentId', 'fullName', 'email', 'className',
+          'accountStatus', 'linkedUid', 'createdBy', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'rosterId', 'studentId', 'fullName', 'email', 'className',
+          'accountStatus', 'linkedUid', 'createdBy', 'createdAt', 'updatedAt'
+        ]) &&
+        data.rosterId is string && data.rosterId == rosterId && isValidId(data.rosterId) &&
+        data.studentId is string && data.studentId.size() >= 1 && data.studentId.size() <= 40 &&
+        data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 120 &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 200 &&
+        data.className is string && data.className.size() >= 1 && data.className.size() <= 60 &&
+        data.accountStatus in ['active', 'inactive'] &&
+        data.linkedUid is string && data.linkedUid.size() <= 128 &&
+        data.createdBy is string && isValidId(data.createdBy) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidAssignment(data, assignmentId) {
+      return data.keys().hasAll([
+          'assignmentId', 'weekNumber', 'title', 'topic', 'instructions',
+          'questions', 'questionCount', 'status', 'deadline', 'createdBy',
+          'createdAt', 'publishedAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'assignmentId', 'weekNumber', 'title', 'topic', 'instructions',
+          'questions', 'questionCount', 'status', 'deadline', 'createdBy',
+          'createdAt', 'publishedAt', 'updatedAt'
+        ]) &&
+        data.assignmentId is string && data.assignmentId == assignmentId && isValidId(data.assignmentId) &&
+        data.weekNumber is int && data.weekNumber >= 1 && data.weekNumber <= 100 &&
+        data.title is string && data.title.size() >= 1 && data.title.size() <= 150 &&
+        data.topic is string && data.topic.size() >= 1 && data.topic.size() <= 150 &&
+        data.instructions is string && data.instructions.size() <= 2500 &&
+        data.questions is list && data.questions.size() >= 1 && data.questions.size() <= 20 &&
+        data.questions[0] is map &&
+        data.questions[0].questionId is string && data.questions[0].questionId.size() >= 1 && data.questions[0].questionId.size() <= 128 &&
+        data.questions[0].prompt is string && data.questions[0].prompt.size() >= 1 && data.questions[0].prompt.size() <= 1500 &&
+        data.questionCount is int && data.questionCount == data.questions.size() &&
+        data.status in ['draft', 'open', 'locked'] &&
+        data.deadline is string && data.deadline.size() <= 60 &&
+        data.createdBy is string && isValidId(data.createdBy) &&
+        data.createdAt is timestamp &&
+        (data.publishedAt == null || data.publishedAt is timestamp) &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidAssessmentMap(assessment) {
+      return assessment is map &&
+        assessment.keys().hasAll(['grammar_vocabulary', 'discourse_management', 'pronunciation', 'overall_score']) &&
+        assessment.keys().hasOnly(['grammar_vocabulary', 'discourse_management', 'pronunciation', 'overall_score']) &&
+        assessment.grammar_vocabulary is map &&
+        assessment.grammar_vocabulary.score is number &&
+        assessment.grammar_vocabulary.score >= 0 &&
+        assessment.grammar_vocabulary.score <= 5 &&
+        assessment.discourse_management is map &&
+        assessment.discourse_management.score is number &&
+        assessment.discourse_management.score >= 0 &&
+        assessment.discourse_management.score <= 5 &&
+        assessment.pronunciation is map &&
+        assessment.pronunciation.score is number &&
+        assessment.pronunciation.score >= 0 &&
+        assessment.pronunciation.score <= 5 &&
+        assessment.overall_score is number &&
+        assessment.overall_score >= 0 &&
+        assessment.overall_score <= 5;
+    }
+
+    function isValidSubmission(data, submissionId) {
+      return data.keys().hasAll([
+          'submissionId', 'studentUid', 'studentId', 'studentName', 'studentEmail',
+          'className', 'assignmentId', 'weekNumber', 'assignmentTitle', 'questionId',
+          'questionPromptSnapshot', 'audioStorageType', 'audioStoragePath',
+          'audioMimeType', 'audioChunkCount', 'recordingDuration', 'processingStatus',
+          'transcript', 'assessment', 'overallScore', 'whatYouDidWell',
+          'areasToImprove', 'expressionCorrections', 'overallComment', 'aiModel',
+          'promptVersion', 'errorMessage', 'resubmissionAllowed', 'submittedAt',
+          'assessedAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'submissionId', 'studentUid', 'studentId', 'studentName', 'studentEmail',
+          'className', 'assignmentId', 'weekNumber', 'assignmentTitle', 'questionId',
+          'questionPromptSnapshot', 'audioStorageType', 'audioStoragePath',
+          'audioMimeType', 'audioChunkCount', 'recordingDuration', 'processingStatus',
+          'transcript', 'assessment', 'overallScore', 'whatYouDidWell',
+          'areasToImprove', 'expressionCorrections', 'overallComment', 'aiModel',
+          'promptVersion', 'errorMessage', 'resubmissionAllowed', 'submittedAt',
+          'assessedAt', 'updatedAt'
+        ]) &&
+        data.submissionId is string && data.submissionId == submissionId && isValidId(data.submissionId) &&
+        data.studentUid is string && isValidId(data.studentUid) &&
+        data.studentId is string && data.studentId.size() <= 40 &&
+        data.studentName is string && data.studentName.size() >= 1 && data.studentName.size() <= 120 &&
+        data.studentEmail is string && data.studentEmail.size() >= 3 && data.studentEmail.size() <= 200 &&
+        data.className is string && data.className.size() <= 60 &&
+        data.assignmentId is string && isValidId(data.assignmentId) &&
+        data.weekNumber is int && data.weekNumber >= 1 && data.weekNumber <= 100 &&
+        data.assignmentTitle is string && data.assignmentTitle.size() >= 1 && data.assignmentTitle.size() <= 150 &&
+        data.questionId is string && isValidId(data.questionId) &&
+        data.questionPromptSnapshot is string && data.questionPromptSnapshot.size() >= 1 && data.questionPromptSnapshot.size() <= 1500 &&
+        data.audioStorageType in ['firebase_storage', 'firestore_chunks', 'none'] &&
+        data.audioStoragePath is string && data.audioStoragePath.size() <= 400 &&
+        data.audioMimeType is string && data.audioMimeType.size() >= 1 && data.audioMimeType.size() <= 100 &&
+        data.audioChunkCount is int && data.audioChunkCount >= 0 && data.audioChunkCount <= 30 &&
+        data.recordingDuration is number && data.recordingDuration >= 0 && data.recordingDuration <= 300 &&
+        data.processingStatus in ['processing', 'feedback_available', 'failed', 'needs_rerecording'] &&
+        data.transcript is string && data.transcript.size() <= 15000 &&
+        (data.assessment == null || isValidAssessmentMap(data.assessment)) &&
+        (data.overallScore == null || (data.overallScore is number && data.overallScore >= 0 && data.overallScore <= 5)) &&
+        data.whatYouDidWell is list && data.whatYouDidWell.size() <= 10 &&
+        data.areasToImprove is list && data.areasToImprove.size() <= 10 &&
+        data.expressionCorrections is list && data.expressionCorrections.size() <= 20 &&
+        data.overallComment is string && data.overallComment.size() <= 3000 &&
+        data.aiModel is string && data.aiModel.size() <= 100 &&
+        data.promptVersion is string && data.promptVersion.size() <= 40 &&
+        data.errorMessage is string && data.errorMessage.size() <= 1000 &&
+        data.resubmissionAllowed is bool &&
+        data.submittedAt is timestamp &&
+        (data.assessedAt == null || data.assessedAt is timestamp) &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidAudioChunk(data) {
+      return data.keys().hasAll(['chunkIndex', 'data', 'studentUid', 'createdAt']) &&
+        data.keys().hasOnly(['chunkIndex', 'data', 'studentUid', 'createdAt']) &&
+        data.chunkIndex is int && data.chunkIndex >= 0 && data.chunkIndex <= 30 &&
+        data.data is string && data.data.size() >= 1 && data.data.size() <= 750000 &&
+        data.studentUid is string && isValidId(data.studentUid) &&
+        data.createdAt is timestamp;
+    }
+
+    // 4. Connection check document
+    match /test/connection {
+      allow get: if isSignedIn();
+    }
+
+    // 5. Users Collection
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isTeacher());
+      allow list: if isBootstrappedTeacher();
+
+      allow create: if isSignedIn() &&
+        isValidId(userId) &&
+        isValidUser(incoming(), userId) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        (
+          (isBootstrappedTeacher() && isOwner(userId)) ||
+          (isTeacher() && incoming().role == 'student') ||
+          (isOwner(userId) && incoming().role == 'student' && incoming().accountStatus == 'active')
+        );
+
+      allow update: if isSignedIn() &&
+        isValidId(userId) &&
+        isValidUser(incoming(), userId) &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().userId == existing().userId &&
+        incoming().email == existing().email &&
+        (
+          isTeacher() ||
+          (
+            isOwner(userId) &&
+            incoming().role == existing().role &&
+            incoming().accountStatus == existing().accountStatus &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['fullName', 'studentId', 'className', 'updatedAt'])
+          )
+        );
+
+      allow delete: if isValidId(userId) && isTeacher();
+    }
+
+    // 6. Student Roster Collection
+    match /studentRoster/{rosterId} {
+      allow get: if isValidId(rosterId) && (
+        isTeacher() ||
+        (isSignedIn() && existing().email == request.auth.token.email)
+      );
+      allow list: if isSignedIn() && (
+        isBootstrappedTeacher() ||
+        resource.data.email == request.auth.token.email
+      );
+
+      allow create: if isTeacher() &&
+        isValidId(rosterId) &&
+        isValidRoster(incoming(), rosterId) &&
+        incoming().createdBy == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isSignedIn() &&
+        isValidId(rosterId) &&
+        isValidRoster(incoming(), rosterId) &&
+        incoming().createdBy == existing().createdBy &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        (
+          isTeacher() ||
+          (
+            existing().email == request.auth.token.email &&
+            existing().linkedUid == '' &&
+            incoming().linkedUid == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['linkedUid', 'updatedAt'])
+          )
+        );
+
+      allow delete: if isValidId(rosterId) && isTeacher();
+    }
+
+    // 7. Weekly Assignments Collection
+    match /assignments/{assignmentId} {
+      allow get: if isSignedIn() && isValidId(assignmentId) && (
+        isTeacher() ||
+        existing().status in ['open', 'locked']
+      );
+      allow list: if isSignedIn() && (
+        isBootstrappedTeacher() ||
+        resource.data.status in ['open', 'locked']
+      );
+
+      allow create: if isTeacher() &&
+        isValidId(assignmentId) &&
+        isValidAssignment(incoming(), assignmentId) &&
+        incoming().createdBy == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+
+      allow update: if isTeacher() &&
+        isValidId(assignmentId) &&
+        isValidAssignment(incoming(), assignmentId) &&
+        incoming().createdBy == existing().createdBy &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time;
+
+      allow delete: if isValidId(assignmentId) && isTeacher();
+    }
+
+    // 8. Submissions Collection
+    match /submissions/{submissionId} {
+      allow get: if isSignedIn() && isValidId(submissionId) && (
+        isTeacher() ||
+        existing().studentUid == request.auth.uid
+      );
+      allow list: if isSignedIn() && (
+        isBootstrappedTeacher() ||
+        resource.data.studentUid == request.auth.uid
+      );
+
+      allow create: if isSignedIn() &&
+        isValidId(submissionId) &&
+        isValidSubmission(incoming(), submissionId) &&
+        incoming().studentUid == request.auth.uid &&
+        incoming().resubmissionAllowed == false &&
+        incoming().processingStatus == 'processing' &&
+        incoming().assessment == null &&
+        incoming().overallScore == null &&
+        incoming().submittedAt == request.time &&
+        incoming().updatedAt == request.time &&
+        exists(/databases/$(database)/documents/assignments/$(incoming().assignmentId)) &&
+        get(/databases/$(database)/documents/assignments/$(incoming().assignmentId)).data.status == 'open';
+
+      allow update: if isSignedIn() &&
+        isValidId(submissionId) &&
+        isValidSubmission(incoming(), submissionId) &&
+        incoming().submissionId == existing().submissionId &&
+        incoming().studentUid == existing().studentUid &&
+        incoming().assignmentId == existing().assignmentId &&
+        incoming().questionId == existing().questionId &&
+        (
+          (
+            isTeacher() &&
+            incoming().updatedAt == request.time &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['resubmissionAllowed', 'updatedAt'])
+          ) ||
+          (
+            existing().studentUid == request.auth.uid &&
+            incoming().updatedAt == request.time &&
+            (
+              // Action 1: Completing AI assessment or recording failure while processing/failed
+              (
+                existing().processingStatus in ['processing', 'failed', 'needs_rerecording'] &&
+                incoming().processingStatus in ['processing', 'feedback_available', 'failed', 'needs_rerecording'] &&
+                incoming().resubmissionAllowed == existing().resubmissionAllowed &&
+                incoming().diff(existing()).affectedKeys().hasOnly([
+                  'processingStatus', 'transcript', 'assessment', 'overallScore',
+                  'whatYouDidWell', 'areasToImprove', 'expressionCorrections',
+                  'overallComment', 'aiModel', 'promptVersion', 'errorMessage',
+                  'assessedAt', 'updatedAt'
+                ])
+              ) ||
+              // Action 2: Authorized resubmission or re-recording after failure/inaudible on an open assignment
+              (
+                (existing().resubmissionAllowed == true || existing().processingStatus in ['failed', 'needs_rerecording']) &&
+                get(/databases/$(database)/documents/assignments/$(existing().assignmentId)).data.status == 'open' &&
+                incoming().resubmissionAllowed == false &&
+                incoming().processingStatus == 'processing' &&
+                incoming().assessment == null &&
+                incoming().overallScore == null &&
+                incoming().submittedAt == request.time &&
+                incoming().diff(existing()).affectedKeys().hasOnly([
+                  'questionPromptSnapshot', 'audioStorageType', 'audioStoragePath',
+                  'audioMimeType', 'audioChunkCount', 'recordingDuration',
+                  'processingStatus', 'transcript', 'assessment', 'overallScore',
+                  'whatYouDidWell', 'areasToImprove', 'expressionCorrections',
+                  'overallComment', 'aiModel', 'promptVersion', 'errorMessage',
+                  'resubmissionAllowed', 'submittedAt', 'assessedAt', 'updatedAt'
+                ])
+              )
+            )
+          )
+        );
+
+      allow delete: if isValidId(submissionId) && isTeacher();
+
+      // Master Gate Subcollection for resilient audio chunks
+      match /audioChunks/{chunkIndex} {
+        allow get: if isSignedIn() && isValidId(submissionId) && isValidId(chunkIndex) && (
+          isTeacher() ||
+          get(/databases/$(database)/documents/submissions/$(submissionId)).data.studentUid == request.auth.uid
+        );
+        allow list: if isSignedIn() && (
+          isBootstrappedTeacher() ||
+          resource.data.studentUid == request.auth.uid
+        );
+
+        allow create: if isSignedIn() &&
+          isValidId(submissionId) &&
+          isValidId(chunkIndex) &&
+          isValidAudioChunk(incoming()) &&
+          incoming().studentUid == request.auth.uid &&
+          incoming().createdAt == request.time &&
+          exists(/databases/$(database)/documents/submissions/$(submissionId)) &&
+          get(/databases/$(database)/documents/submissions/$(submissionId)).data.studentUid == request.auth.uid;
+
+        allow update: if isSignedIn() &&
+          isValidId(submissionId) &&
+          isValidId(chunkIndex) &&
+          isValidAudioChunk(incoming()) &&
+          incoming().studentUid == request.auth.uid &&
+          incoming().studentUid == existing().studentUid &&
+          incoming().createdAt == request.time &&
+          exists(/databases/$(database)/documents/submissions/$(submissionId)) &&
+          get(/databases/$(database)/documents/submissions/$(submissionId)).data.studentUid == request.auth.uid;
+
+        allow delete: if isSignedIn() && isValidId(submissionId) && isValidId(chunkIndex) && (
+          isTeacher() ||
+          get(/databases/$(database)/documents/submissions/$(submissionId)).data.studentUid == request.auth.uid
+        );
+      }
+    }
+  }
+}
